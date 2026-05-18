@@ -616,6 +616,35 @@ export async function deployPosition({
       fee_tvl_ratio,
       volatility: normalizedVolatility,
     });
+    log("deploy", "DRY RUN — paper position opened; no transaction sent");
+    log("deploy", `Pool: ${pool_address}`);
+    log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
+    log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
+    log("deploy", `Paper position: ${paper?.position?.position}`);
+    log("deploy", `Paper balance: ${paper?.balance_sol} SOL`);
+    appendDecision({
+      type: "deploy",
+      actor: "SCREENER",
+      pool: pool_address,
+      pool_name,
+      position: paper?.position?.position,
+      summary: `DRY RUN paper deployed ${finalAmountY} SOL with ${activeStrategy}`,
+      reason: `Chosen range ${minBinId}→${maxBinId} around active bin ${activeBin.binId}`,
+      risks: [
+        normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
+        fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
+      ].filter(Boolean),
+      metrics: {
+        amount_sol: finalAmountY,
+        strategy: activeStrategy,
+        active_bin: activeBin.binId,
+        min_bin: minBinId,
+        max_bin: maxBinId,
+        downside_pct: downside_pct ?? null,
+        upside_pct: upside_pct ?? null,
+        paper: true,
+      },
+    });
     _positionsCacheAt = 0;
     return {
       dry_run: true,

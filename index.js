@@ -546,6 +546,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 
     const allCandidates = [];
+    log("screening", `Candidate recon starting: ${candidates.length} candidate(s)`);
+    const reconStartedAt = Date.now();
     for (const pool of candidates) {
       const mint = pool.base?.mint;
       const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
@@ -562,6 +564,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
     }
+    log("screening", `Candidate recon finished in ${Math.round((Date.now() - reconStartedAt) / 1000)}s — enriched=${allCandidates.length}`);
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
@@ -602,6 +605,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         reason: combinedExamples || "All candidates filtered before deploy",
         rejected: combined.slice(0, 5).map((entry) => `${entry.name}: ${entry.reason}`),
       });
+      log("screening", `Final result: NO DEPLOY — no candidates passed token recon/filtering (${combined.length} rejected example(s))`);
       return screenReport;
     }
 
@@ -631,14 +635,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
           pool: passing[0].pool?.pool,
           pool_name: candidateName,
         });
+        log("screening", `Final result: NO DEPLOY — single candidate skipped (${candidateName}: ${skipReason})`);
         return screenReport;
       }
     }
 
     // Pre-fetch active_bin for all passing candidates in parallel
+    log("screening", `Active-bin prefetch starting: ${passing.length} candidate(s)`);
+    const activeBinStartedAt = Date.now();
     const activeBinResults = await Promise.allSettled(
       passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
     );
+    const activeBinOk = activeBinResults.filter((r) => r.status === "fulfilled").length;
+    log("screening", `Active-bin prefetch finished in ${Math.round((Date.now() - activeBinStartedAt) / 1000)}s — ok=${activeBinOk}/${passing.length}`);
 
     // Build compact candidate blocks
     const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
@@ -711,6 +720,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     let deployAttempted = false;
     let deploySucceeded = false;
+    let deployResult = null;
+    log("screening", `Asking SCREENER LLM... candidates=${passing.length}, model=${config.llm.screeningModel}`);
+    const llmStartedAt = Date.now();
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -791,10 +803,12 @@ IMPORTANT:
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            deployResult = result;
           }
           await liveMessage?.toolFinish(name, result, success);
         },
       });
+    log("screening", `SCREENER LLM finished in ${Math.round((Date.now() - llmStartedAt) / 1000)}s — deployAttempted=${deployAttempted}, deploySucceeded=${deploySucceeded}`);
     screenReport = await normalizeScreeningReport(content, { deployAttempted, deploySucceeded, candidates: passing });
     if (/⛔\s*NO DEPLOY/i.test(screenReport)) {
       appendDecision({
@@ -803,6 +817,7 @@ IMPORTANT:
         summary: "LLM chose no deploy",
         reason: stripThink(screenReport).slice(0, 500),
       });
+      log("screening", "Final result: NO DEPLOY — LLM chose no deploy");
     } else if (!deploySucceeded) {
       appendDecision({
         type: "no_deploy",
@@ -810,6 +825,9 @@ IMPORTANT:
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
         reason: stripThink(screenReport).slice(0, 500),
       });
+      log("screening", `Final result: NO DEPLOY — ${deployAttempted ? "deploy attempt did not succeed" : "no successful deploy in screening cycle"}`);
+    } else {
+      log("screening", `Final result: DEPLOY ${deployResult?.pool_name || deployResult?.pool || "unknown"} position=${deployResult?.position || "unknown"} amount=${deployResult?.amount_y ?? deployResult?.would_deploy?.amount_y ?? "?"} SOL${deployResult?.dry_run ? " (paper)" : ""}`);
     }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
