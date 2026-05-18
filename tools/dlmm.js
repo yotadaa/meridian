@@ -564,6 +564,12 @@ export async function deployPosition({
     throw new Error("Invalid bin range: bins_below and bins_above must be whole-bin integers.");
   }
   const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+  if (downside_pct == null && activeBinsBelow < minBinsBelow) {
+    activeBinsBelow = Math.max(
+      minBinsBelow,
+      Number(config.strategy.defaultBinsBelow ?? config.strategy.maxBinsBelow ?? minBinsBelow),
+    );
+  }
   const totalBins = activeBinsBelow + activeBinsAbove;
   if (totalBins < minBinsBelow) {
     throw new Error(
