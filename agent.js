@@ -108,11 +108,27 @@ const CONFIG_READ_ONLY_INTENTS = /\b(check|show|what(?:'s| is)?|review|inspect|s
 const DECISION_EXPLANATION_INTENTS = /\b(why did you|why'd you|why was (?:this|that|it)|what made you|what was the reason|why no deploy|why didn't you deploy|why did you close|why did you deploy|why did you skip)\b/i;
 
 function shouldRequireRealToolUse(goal, agentType, interactive = false) {
-  if (agentType === "MANAGER") return false;
+  if (agentType === "MANAGER") return true;
   if (DECISION_EXPLANATION_INTENTS.test(goal)) return false;
   if (CONFIG_READ_ONLY_INTENTS.test(goal)) return false;
   if (MUTATING_TOOL_INTENTS.test(goal)) return true;
   return interactive && LIVE_DATA_TOOL_INTENTS.test(goal);
+}
+
+function initialRequiredToolName(agentType, goal, interactive = false) {
+  if (agentType === "SCREENER") return "get_top_candidates";
+  if (agentType === "MANAGER") return "get_my_positions";
+  if (!shouldRequireRealToolUse(goal, agentType, interactive)) return null;
+  if (/\b(balance|wallet|sol|how much)\b/i.test(goal)) return "get_wallet_balance";
+  if (/\b(position|portfolio|open|pnl|yield|range)\b/i.test(goal)) return "get_my_positions";
+  if (/\b(screen|candidate|find pool|search|research|token)\b/i.test(goal)) return "get_top_candidates";
+  return null;
+}
+
+function toolChoiceForName(name) {
+  return name
+    ? { type: "function", function: { name } }
+    : "required";
 }
 
 function buildMessages(systemPrompt, sessionHistory, goal, providerMode = "system") {
@@ -192,9 +208,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
       let response;
       let usedModel = activeModel;
-      // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
+      // Force a tool call on step 0 for tool-required requests — prevents the model from inventing outcomes.
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
+      const firstToolName = initialRequiredToolName(agentType, goal, interactive);
+      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? toolChoiceForName(firstToolName) : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -214,9 +231,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             attempt -= 1;
             continue;
           }
-          if (toolChoice === "required" && isToolChoiceRequiredError(error)) {
+          if (toolChoice !== "auto" && isToolChoiceRequiredError(error)) {
             toolChoice = "auto";
-            log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
+            log("agent", "Provider rejected forced tool_choice — retrying with tool_choice=auto");
             attempt -= 1;
             continue;
           }
@@ -287,8 +304,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           messages.push({
             role: providerMode === "system" ? "system" : "user",
             content: providerMode === "system"
-              ? "You have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result."
-              : "[SYSTEM REMINDER]\nYou have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result.",
+              ? `You have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call ${firstToolName || "the appropriate tool"} first, then report only the real result.`
+              : `[SYSTEM REMINDER]\nYou have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call ${firstToolName || "the appropriate tool"} first, then report only the real result.`,
           });
           continue;
         }
