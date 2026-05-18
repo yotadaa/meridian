@@ -3,7 +3,7 @@ import cron from "node-cron";
 import readline from "readline";
 import path from "path";
 import { fileURLToPath } from "url";
-import { agentLoop } from "./agent.js";
+import { agentLoop, formatWithLLM } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
@@ -100,13 +100,18 @@ function stripThink(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
-function normalizeScreeningReport(content, { deployAttempted = false, deploySucceeded = false, candidates = [] } = {}) {
+function isValidScreeningReport(content) {
+  const cleaned = stripThink(content || "").trim();
+  return /^\s*(🚀\s*DEPLOYED|⛔\s*NO DEPLOY)\b/i.test(cleaned);
+}
+
+function isDeployReport(content) {
+  return /^\s*🚀\s*DEPLOYED\b/i.test(stripThink(content || "").trim());
+}
+
+function fallbackScreeningReport(content, { deploySucceeded = false, candidates = [] } = {}) {
   const cleaned = stripThink(content || "").replace(/\n{3,}/g, "\n\n").trim();
   const saysDeployed = /^\s*🚀\s*DEPLOYED\b/i.test(cleaned);
-  const saysNoDeploy = /^\s*⛔\s*NO DEPLOY\b/i.test(cleaned);
-
-  if (saysDeployed && deploySucceeded) return cleaned;
-  if (saysNoDeploy) return cleaned;
 
   const best = candidates[0]?.pool?.name || candidates[0]?.name || "none";
   const rejected = candidates.length
@@ -132,6 +137,60 @@ function normalizeScreeningReport(content, { deployAttempted = false, deploySucc
     "REJECTED",
     rejected,
   ].join("\n");
+}
+
+async function normalizeScreeningReport(content, { deployAttempted = false, deploySucceeded = false, candidates = [] } = {}) {
+  const cleaned = stripThink(content || "").replace(/\n{3,}/g, "\n\n").trim();
+
+  if (isDeployReport(cleaned) && !deploySucceeded) {
+    return fallbackScreeningReport(cleaned, { deploySucceeded, candidates });
+  }
+  if (isValidScreeningReport(cleaned)) return cleaned;
+
+  const candidateNames = candidates.slice(0, 8).map(({ pool, name }) => pool?.name || name).filter(Boolean).join(", ") || "none";
+  try {
+    const reformatted = stripThink(await formatWithLLM(`
+Rewrite this screening result into the required format. Do not change the decision. Do not invent facts, metrics, tools, or deploy results.
+
+SAFETY:
+- deploy_position_success = ${deploySucceeded ? "true" : "false"}
+- If deploy_position_success is false, the answer MUST start with exactly: ⛔ NO DEPLOY
+- Only use 🚀 DEPLOYED if deploy_position_success is true.
+- Keep the reasoning based only on the raw answer and candidate names.
+
+Required no-deploy format:
+⛔ NO DEPLOY
+
+Cycle finished with no valid entry.
+
+BEST LOOKING CANDIDATE
+<name or none>
+
+WHY SKIPPED
+<2-4 concise sentences>
+
+REJECTED
+- <candidate>: <reason>
+
+Candidate names available: ${candidateNames}
+
+Raw answer:
+${cleaned || "<empty>"}
+`, { model: config.llm.screeningModel, maxOutputTokens: 1200 }));
+
+    if (isDeployReport(reformatted) && !deploySucceeded) {
+      log("screening_warn", "Formatter returned deploy without successful deploy tool; using safe no-deploy fallback");
+      return fallbackScreeningReport(cleaned, { deploySucceeded, candidates });
+    }
+    if (isValidScreeningReport(reformatted)) {
+      log("screening", "Reformatted malformed screening report with LLM");
+      return reformatted;
+    }
+    log("screening_warn", "LLM formatter returned invalid screening report; using safe fallback");
+  } catch (error) {
+    log("screening_warn", `LLM formatter failed: ${error.message}; using safe fallback`);
+  }
+  return fallbackScreeningReport(cleaned, { deployAttempted, deploySucceeded, candidates });
 }
 
 function sanitizeUntrustedPromptText(text, maxLen = 500) {
@@ -736,7 +795,7 @@ IMPORTANT:
           await liveMessage?.toolFinish(name, result, success);
         },
       });
-    screenReport = normalizeScreeningReport(content, { deployAttempted, deploySucceeded, candidates: passing });
+    screenReport = await normalizeScreeningReport(content, { deployAttempted, deploySucceeded, candidates: passing });
     if (/⛔\s*NO DEPLOY/i.test(screenReport)) {
       appendDecision({
         type: "no_deploy",

@@ -423,6 +423,22 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   return { content: "Max steps reached. Review logs for partial progress.", userMessage: goal };
 }
 
+export async function formatWithLLM(prompt, { model = null, maxOutputTokens = 1200 } = {}) {
+  const response = await createLLMClient().chat.completions.create({
+    model: model || DEFAULT_MODEL,
+    messages: [
+      {
+        role: "system",
+        content: "You format trading-agent reports. Preserve the original decision and facts. Do not call tools. Do not invent data.",
+      },
+      { role: "user", content: prompt },
+    ],
+    temperature: 0,
+    max_tokens: maxOutputTokens,
+  });
+  return response.choices?.[0]?.message?.content || "";
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
