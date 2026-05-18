@@ -24,6 +24,7 @@ paper-trading.json
 
 # Logs
 logs/
+previews/
 
 # OS
 .DS_Store

@@ -21,6 +21,12 @@ let _polling = false;
 let _liveMessageDepth = 0;
 let _warnedMissingChatId = false;
 let _warnedMissingAllowedUsers = false;
+let _consecutiveFailures = 0;
+let _disabledUntil = 0;
+
+const TELEGRAM_POST_TIMEOUT_MS = Number(process.env.TELEGRAM_POST_TIMEOUT_MS || 10_000);
+const TELEGRAM_FAILURE_LIMIT = Number(process.env.TELEGRAM_FAILURE_LIMIT || 5);
+const TELEGRAM_BACKOFF_MS = Number(process.env.TELEGRAM_BACKOFF_MS || 5 * 60_000);
 
 // ─── chatId persistence ──────────────────────────────────────────
 function loadChatId() {
@@ -80,56 +86,75 @@ function isAuthorizedIncomingMessage(msg) {
 
 // ─── Core send ───────────────────────────────────────────────────
 export function isEnabled() {
-  return !!TOKEN;
+  return !!TOKEN && Date.now() >= _disabledUntil;
+}
+
+function recordTelegramSuccess() {
+  _consecutiveFailures = 0;
+}
+
+function recordTelegramFailure(method, message) {
+  _consecutiveFailures += 1;
+  log("telegram_error", `${method} failed: ${message}`);
+  if (_consecutiveFailures >= TELEGRAM_FAILURE_LIMIT) {
+    _disabledUntil = Date.now() + TELEGRAM_BACKOFF_MS;
+    log("telegram_warn", `Telegram temporarily disabled for ${Math.round(TELEGRAM_BACKOFF_MS / 1000)}s after ${_consecutiveFailures} consecutive failures`);
+    _consecutiveFailures = 0;
+  }
 }
 
 async function postTelegram(method, body) {
-  if (!TOKEN || !chatId) return null;
+  if (!TOKEN || !chatId || Date.now() < _disabledUntil) return null;
   try {
     const res = await fetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, ...body }),
+      signal: AbortSignal.timeout(TELEGRAM_POST_TIMEOUT_MS),
     });
     if (!res.ok) {
       const err = await res.text();
+      if (method === "editMessageText" && err.includes("message is not modified")) return null;
       log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
       return null;
     }
+    recordTelegramSuccess();
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    recordTelegramFailure(method, e.message);
     return null;
   }
 }
 
 async function postTelegramRaw(method, body) {
-  if (!TOKEN) return null;
+  if (!TOKEN || Date.now() < _disabledUntil) return null;
   try {
     const res = await fetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TELEGRAM_POST_TIMEOUT_MS),
     });
     if (!res.ok) {
       const err = await res.text();
       log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
       return null;
     }
+    recordTelegramSuccess();
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    recordTelegramFailure(method, e.message);
     return null;
   }
 }
 
 export async function sendMessage(text) {
-  if (!TOKEN || !chatId) return;
+  if (!isEnabled() || !chatId) return;
   return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
 }
 
 export async function sendMessageWithButtons(text, inlineKeyboard) {
-  if (!TOKEN || !chatId) return;
+  if (!isEnabled() || !chatId) return;
   return postTelegram("sendMessage", {
     text: String(text).slice(0, 4096),
     reply_markup: { inline_keyboard: inlineKeyboard },
@@ -137,12 +162,12 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
 }
 
 export async function sendHTML(html) {
-  if (!TOKEN || !chatId) return;
+  if (!isEnabled() || !chatId) return;
   return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
 }
 
 export async function editMessage(text, messageId) {
-  if (!TOKEN || !chatId || !messageId) return null;
+  if (!isEnabled() || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
     text: String(text).slice(0, 4096),
@@ -150,7 +175,7 @@ export async function editMessage(text, messageId) {
 }
 
 export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
-  if (!TOKEN || !chatId || !messageId) return null;
+  if (!isEnabled() || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
     text: String(text).slice(0, 4096),
@@ -159,7 +184,7 @@ export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
 }
 
 export async function answerCallbackQuery(callbackQueryId, text = "") {
-  if (!TOKEN || !callbackQueryId) return null;
+  if (!isEnabled() || !callbackQueryId) return null;
   return postTelegramRaw("answerCallbackQuery", {
     callback_query_id: callbackQueryId,
     ...(text ? { text: String(text).slice(0, 200) } : {}),
@@ -171,7 +196,7 @@ export function hasActiveLiveMessage() {
 }
 
 function createTypingIndicator() {
-  if (!TOKEN || !chatId) {
+  if (!isEnabled() || !chatId) {
     return { stop() {} };
   }
 
@@ -249,7 +274,7 @@ function summarizeToolResult(name, result) {
 }
 
 export async function createLiveMessage(title, intro = "Starting...") {
-  if (!TOKEN || !chatId) return null;
+  if (!isEnabled() || !chatId) return null;
   const typing = createTypingIndicator();
 
   const state = {
@@ -347,6 +372,10 @@ export async function createLiveMessage(title, intro = "Starting...") {
 // ─── Long polling ────────────────────────────────────────────────
 async function poll(onMessage) {
   while (_polling) {
+    if (Date.now() < _disabledUntil) {
+      await sleep(Math.min(30_000, Math.max(1000, _disabledUntil - Date.now())));
+      continue;
+    }
     try {
       const res = await fetch(
         `${BASE}/getUpdates?offset=${_offset}&timeout=30`,
@@ -380,7 +409,7 @@ async function poll(onMessage) {
       }
     } catch (e) {
       if (!e.message?.includes("aborted")) {
-        log("telegram_error", `Poll error: ${e.message}`);
+        recordTelegramFailure("poll", e.message);
       }
       await sleep(5000);
     }
@@ -388,7 +417,7 @@ async function poll(onMessage) {
 }
 
 export function startPolling(onMessage) {
-  if (!TOKEN) return;
+  if (!isEnabled()) return;
   _polling = true;
   poll(onMessage); // fire-and-forget
   log("telegram", "Bot polling started");

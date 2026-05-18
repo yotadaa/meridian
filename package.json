@@ -10,6 +10,7 @@
   "scripts": {
     "setup": "node setup.js",
     "env:encrypt": "node scripts/envrypt.js encrypt",
+    "preview": "node scripts/generate-preview.js",
     "start": "node index.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:restart": "pm2 restart meridian --update-env",
