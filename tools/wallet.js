@@ -8,6 +8,7 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { getPaperBalance } from "./paper.js";
 
 let _connection = null;
 let _wallet = null;
@@ -30,8 +31,9 @@ const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
 const DEFAULT_JUPITER_API_KEY = "b15d42e9-e0e4-4f90-a424-ae41ceeaa382";
 
 function applyDryRunVirtualSol(balance) {
-  const virtualSol = Number(config.management?.dryRunVirtualSol ?? 0);
-  if (process.env.DRY_RUN !== "true" || !Number.isFinite(virtualSol) || virtualSol <= 0) {
+  const paperSol = getPaperBalance();
+  const virtualSol = paperSol ?? Number(config.management?.dryRunVirtualSol ?? 0);
+  if (process.env.DRY_RUN !== "true" || !Number.isFinite(virtualSol) || virtualSol < 0) {
     return balance;
   }
   const solPrice = Number(balance.sol_price || 0);

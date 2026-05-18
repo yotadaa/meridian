@@ -25,7 +25,8 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { getWalletBalances, normalizeMint } from "./wallet.js";
+import { closePaperPosition, getPaperPositions, openPaperPosition } from "./paper.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -570,24 +571,6 @@ export async function deployPosition({
     );
   }
 
-  if (process.env.DRY_RUN === "true") {
-    return {
-      dry_run: true,
-      would_deploy: {
-        pool_address,
-        strategy: activeStrategy,
-        bins_below: activeBinsBelow,
-        bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-        amount_x: finalAmountX,
-        amount_y: finalAmountY,
-        wide_range: totalBins > 69,
-      },
-      message: "DRY RUN — no transaction sent",
-    };
-  }
-
   const isWideRange = totalBins > 69;
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
@@ -599,6 +582,44 @@ export async function deployPosition({
     throw new Error(
       `Single-side SOL deploy must end at the SDK active bin. Expected ${activeBin.binId}, got ${maxBinId}.`,
     );
+  }
+
+  if (process.env.DRY_RUN === "true") {
+    const paper = openPaperPosition({
+      pool_address,
+      pool_name,
+      base_mint: pool.lbPair.tokenXMint.toString(),
+      token_x_symbol: null,
+      token_y_symbol: null,
+      active_bin: activeBin.binId,
+      lower_bin: minBinId,
+      upper_bin: maxBinId,
+      amount_sol: finalAmountY,
+      strategy: activeStrategy,
+      bins_below: activeBinsBelow,
+      bins_above: activeBinsAbove,
+      bin_step: actualBinStep,
+      base_fee,
+    });
+    _positionsCacheAt = 0;
+    return {
+      dry_run: true,
+      success: true,
+      position: paper?.position?.position,
+      paper_balance_sol: paper?.balance_sol,
+      would_deploy: {
+        pool_address,
+        strategy: activeStrategy,
+        bins_below: activeBinsBelow,
+        bins_above: activeBinsAbove,
+        downside_pct: downside_pct ?? null,
+        upside_pct: upside_pct ?? null,
+        amount_x: finalAmountX,
+        amount_y: finalAmountY,
+        wide_range: isWideRange,
+      },
+      message: "DRY RUN — paper position opened; no transaction sent",
+    };
   }
 
   await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
@@ -1337,6 +1358,14 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       }
     }
 
+    if (useLocalWallet && process.env.DRY_RUN === "true") {
+      const paperPositions = getPaperPositions();
+      const known = new Set(positions.map((p) => p.position));
+      for (const paperPosition of paperPositions) {
+        if (!known.has(paperPosition.position)) positions.push(paperPosition);
+      }
+    }
+
     const result = {
       wallet: walletAddress,
       total_positions: positions.length,
@@ -1504,7 +1533,19 @@ export async function claimFees({ position_address }) {
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
-    return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
+    const paper = closePaperPosition(position_address, { reason });
+    if (paper?.found) {
+      _positionsCacheAt = 0;
+      return {
+        dry_run: true,
+        success: true,
+        closed: position_address,
+        returned_sol: paper.returned_sol,
+        paper_balance_sol: paper.balance_sol,
+        message: "DRY RUN — paper position closed; no transaction sent",
+      };
+    }
+    return { dry_run: true, would_close: position_address, message: "DRY RUN — no matching paper position; no transaction sent" };
   }
 
   const tracked = getTrackedPosition(position_address);

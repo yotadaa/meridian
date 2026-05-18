@@ -109,6 +109,8 @@ When `DRY_RUN=true`, Meridian can simulate a funded wallet using `dryRunVirtualS
 }
 ```
 
+Dry-run deploys and closes are tracked in `paper-trading.json`: opening a paper position debits the virtual SOL balance, closing it credits the deployed SOL back, and dry-run positions appear in position listings. This is a local paper ledger only; no on-chain transaction is sent.
+
 > Never put your private key or API keys in `user-config.json` — use `.env` only. Both files are gitignored.
 
 Optional encrypted `.env` flow:
