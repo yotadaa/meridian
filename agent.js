@@ -131,6 +131,10 @@ function toolChoiceForName(name) {
     : "required";
 }
 
+function isFormattedNoDeployAnswer(content) {
+  return /^\s*⛔\s*NO DEPLOY\b/i.test(String(content || ""));
+}
+
 function buildMessages(systemPrompt, sessionHistory, goal, providerMode = "system") {
   if (providerMode === "user_embedded") {
     return [
@@ -292,6 +296,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           continue;
         }
         if (mustUseRealTool && !sawToolCall) {
+          if (agentType === "SCREENER" && isFormattedNoDeployAnswer(msg.content)) {
+            log("agent", "Accepted formatted no-deploy answer without tool call");
+            return { content: msg.content, userMessage: goal };
+          }
           noToolRetryCount += 1;
           messages.pop();
           log("agent", `Rejected no-tool final answer (${noToolRetryCount}/2) for tool-required request`);

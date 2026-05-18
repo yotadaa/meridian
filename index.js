@@ -100,6 +100,40 @@ function stripThink(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
+function normalizeScreeningReport(content, { deployAttempted = false, deploySucceeded = false, candidates = [] } = {}) {
+  const cleaned = stripThink(content || "").replace(/\n{3,}/g, "\n\n").trim();
+  const saysDeployed = /^\s*🚀\s*DEPLOYED\b/i.test(cleaned);
+  const saysNoDeploy = /^\s*⛔\s*NO DEPLOY\b/i.test(cleaned);
+
+  if (saysDeployed && deploySucceeded) return cleaned;
+  if (saysNoDeploy) return cleaned;
+
+  const best = candidates[0]?.pool?.name || candidates[0]?.name || "none";
+  const rejected = candidates.length
+    ? candidates.slice(0, 5).map(({ pool, name }) => `- ${pool?.name || name || "unknown"}: not selected by final screening decision`).join("\n")
+    : "- none: no candidates available";
+  const reason = saysDeployed && !deploySucceeded
+    ? "The model claimed a deploy, but no successful deploy_position tool result was recorded, so the cycle is treated as no deploy."
+    : cleaned
+      ? `The model did not return the required screening report format. Raw answer: ${cleaned.slice(0, 700)}`
+      : "The model returned an empty screening report.";
+
+  return [
+    "⛔ NO DEPLOY",
+    "",
+    "Cycle finished with no valid entry.",
+    "",
+    "BEST LOOKING CANDIDATE",
+    best,
+    "",
+    "WHY SKIPPED",
+    reason,
+    "",
+    "REJECTED",
+    rejected,
+  ].join("\n");
+}
+
 function sanitizeUntrustedPromptText(text, maxLen = 500) {
   if (!text) return null;
   const cleaned = String(text)
@@ -702,20 +736,20 @@ IMPORTANT:
           await liveMessage?.toolFinish(name, result, success);
         },
       });
-    screenReport = content;
-    if (/⛔\s*NO DEPLOY/i.test(content)) {
+    screenReport = normalizeScreeningReport(content, { deployAttempted, deploySucceeded, candidates: passing });
+    if (/⛔\s*NO DEPLOY/i.test(screenReport)) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     } else if (!deploySucceeded) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     }
   } catch (error) {
