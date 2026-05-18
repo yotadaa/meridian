@@ -82,6 +82,7 @@ export function estimatePaperPosition(position, market = {}) {
   // Treat fee_tvl_ratio as a 24h fee yield proxy, scaled by age and base fee.
   const ageDays = ageMinutes / 1440;
   const feePct = Math.min(25, (feeTvlRatio + baseFee) * ageDays);
+  const feeYieldPct = amountSol > 0 ? Math.round((feeSolFromPct(amountSol, feePct) / amountSol) * 10000) / 100 : 0;
   const pnlPct = Math.round((inventoryPnlPct + feePct) * 100) / 100;
   const pnlSol = roundSol(amountSol * pnlPct / 100);
   const feeSol = roundSol(amountSol * feePct / 100);
@@ -103,12 +104,18 @@ export function estimatePaperPosition(position, market = {}) {
     pnl_true_usd: pnlSol,
     pnl_pct: pnlPct,
     pnl_pct_derived: pnlPct,
-    fee_per_tvl_24h: feeTvlRatio || null,
+    fee_per_tvl_24h: Math.round(feePct * 100) / 100,
+    yield_pct: feeYieldPct,
+    fee_yield_pct: feeYieldPct,
     paper_estimated: true,
     paper_value_sol: valueSol,
     paper_pnl_sol: pnlSol,
     paper_fee_sol: feeSol,
   };
+}
+
+function feeSolFromPct(amountSol, feePct) {
+  return roundSol(Number(amountSol || 0) * Number(feePct || 0) / 100);
 }
 
 export function openPaperPosition(details) {
