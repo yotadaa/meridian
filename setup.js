@@ -152,11 +152,6 @@ console.log("── API Keys & Wallet ──────────────
 
 const alreadySet = (val) => val ? "*** (already set — Enter to keep)" : "";
 
-const openrouterKey = await ask(
-  "OpenRouter API key (sk-or-...)",
-  alreadySet(ev("OPENROUTER_API_KEY", ""))
-);
-
 const walletKey = await ask(
   "Wallet private key (base58)",
   alreadySet(ev("WALLET_PRIVATE_KEY", existingConfig.walletKey || ""))
@@ -225,6 +220,12 @@ const minSolToOpen = await askNum(
 const dryRun = await askBool(
   "Dry run mode? (no real transactions)",
   e("dryRun", true)
+);
+
+const dryRunVirtualSol = await askNum(
+  "Virtual SOL balance for dry run simulation",
+  e("dryRunVirtualSol", 1),
+  { min: 0 }
 );
 
 const minBinsBelow = await askNum(
@@ -400,12 +401,16 @@ const isKept = (val) => !val || val.startsWith("***");
 
 const envMap = {
   ...existingEnv,
-  ...(isKept(openrouterKey) ? {} : { OPENROUTER_API_KEY: openrouterKey }),
   ...(isKept(walletKey)     ? {} : { WALLET_PRIVATE_KEY: walletKey }),
   ...(rpcUrl                ? { RPC_URL: rpcUrl } : {}),
   ...(isKept(heliusKey)     ? {} : { HELIUS_API_KEY: heliusKey }),
   ...(isKept(telegramToken) ? {} : { TELEGRAM_BOT_TOKEN: telegramToken }),
   ...(telegramChatId        ? { TELEGRAM_CHAT_ID: telegramChatId } : {}),
+  LLM_PROVIDER: provider.key,
+  LLM_BASE_URL: llmBaseUrl,
+  ...(llmApiKey ? { LLM_API_KEY: llmApiKey } : {}),
+  ...(llmModel  ? { LLM_MODEL: llmModel } : {}),
+  ...(provider.key !== "openrouter" ? { OPENROUTER_API_KEY: "" } : {}),
   DRY_RUN: dryRun ? "true" : "false",
 };
 fs.writeFileSync(ENV_PATH, buildEnv(envMap));
@@ -418,6 +423,7 @@ const userConfig = {
   deployAmountSol,
   maxPositions,
   minSolToOpen,
+  dryRunVirtualSol,
   minBinsBelow,
   maxBinsBelow,
   defaultBinsBelow,
@@ -458,6 +464,7 @@ console.log(`
 
   Preset:       ${presetName}
   Dry run:      ${dryRun ? "YES — no real transactions" : "NO — live trading"}
+  Virtual SOL:  ${dryRun ? `${dryRunVirtualSol} SOL simulated` : "disabled in live mode"}
 
   Deploy:       ${deployAmountSol} SOL/position  ·  max ${maxPositions} positions
   Min balance:  ${minSolToOpen} SOL to open new position

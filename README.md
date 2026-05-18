@@ -41,14 +41,14 @@ The harness also keeps a structured decision log in `decision-log.json` for depl
 - Pool screening API — fee/TVL ratios, volume, organic scores, holder counts
 - Jupiter API — token audit, mcap, launchpad, price stats
 
-Agents are powered via **OpenRouter** and can be swapped for any compatible model.
+Agents use an **OpenAI-compatible chat completions API**. OpenRouter is the default, and you can switch to OpenAI, LM Studio, Ollama, or any compatible provider by changing the LLM provider settings.
 
 ---
 
 ## Requirements
 
 - Node.js 18+
-- [OpenRouter](https://openrouter.ai) API key
+- LLM API key from OpenRouter, OpenAI, or another OpenAI-compatible provider
 - Solana wallet (base58 private key)
 - Solana RPC endpoint ([Helius](https://helius.xyz) recommended)
 - Telegram bot token (optional)
@@ -81,11 +81,32 @@ Create `.env`:
 ```env
 WALLET_PRIVATE_KEY=your_base58_private_key
 RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+
+# OpenRouter default
+LLM_PROVIDER=openrouter
+LLM_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_API_KEY=sk-or-...
+
+# For custom providers, use LLM_API_KEY instead:
+# LLM_PROVIDER=custom
+# LLM_BASE_URL=https://your-provider.example/v1
+# LLM_API_KEY=your_provider_key
+# LLM_MODEL=your/model-name
+
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
 TELEGRAM_CHAT_ID=                       # auto-filled on first message
 DRY_RUN=true                            # set false for live trading
+```
+
+When `DRY_RUN=true`, Meridian can simulate a funded wallet using `dryRunVirtualSol` in `user-config.json`. This affects read-only agent decisions only; live mode always uses the real on-chain wallet balance.
+
+```json
+{
+  "dryRun": true,
+  "dryRunVirtualSol": 1,
+  "deployAmountSol": 0.2
+}
 ```
 
 > Never put your private key or API keys in `user-config.json` — use `.env` only. Both files are gitignored.
@@ -107,6 +128,35 @@ cp user-config.example.json user-config.json
 ```
 
 See [Config reference](#config-reference) below.
+
+### LLM provider setup
+
+Meridian supports any OpenAI-compatible `/v1/chat/completions` provider.
+
+| Provider | `LLM_PROVIDER` | `LLM_BASE_URL` | Key var | Model example |
+|---|---|---|---|---|
+| OpenRouter | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` or `LLM_API_KEY` | `openrouter/healer-alpha` |
+| OpenAI | `openai` | `https://api.openai.com/v1` | `LLM_API_KEY` | `gpt-4.1-mini` |
+| LM Studio | `lm-studio` | `http://localhost:1234/v1` | `LLM_API_KEY=lm-studio` | your loaded model name |
+| Ollama | `ollama` | `http://localhost:11434/v1` | `LLM_API_KEY=ollama` | `llama3.1` |
+| Custom | `custom` | provider `/v1` URL | `LLM_API_KEY` | provider model ID |
+
+You can set one global model with `LLM_MODEL`, or set role-specific models in `user-config.json`:
+
+```json
+{
+  "llmProvider": "custom",
+  "llmBaseUrl": "https://your-provider.example/v1",
+  "llmModel": "your/default-model",
+  "managementModel": "your/manager-model",
+  "screeningModel": "your/screener-model",
+  "generalModel": "your/chat-model"
+}
+```
+
+Keep real API keys in `.env`, not `user-config.json`. If you must change provider settings while Meridian is running, ask the agent to update config, for example: `set llmBaseUrl to http://localhost:1234/v1 and generalModel to llama-3.1-8b`.
+
+After changing `.env`, restart the process. With PM2, use `npm run pm2:restart`.
 
 ### 3. Run
 

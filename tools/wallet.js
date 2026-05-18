@@ -29,6 +29,26 @@ const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
 const DEFAULT_JUPITER_API_KEY = "b15d42e9-e0e4-4f90-a424-ae41ceeaa382";
 
+function applyDryRunVirtualSol(balance) {
+  const virtualSol = Number(config.management?.dryRunVirtualSol ?? 0);
+  if (process.env.DRY_RUN !== "true" || !Number.isFinite(virtualSol) || virtualSol <= 0) {
+    return balance;
+  }
+  const solPrice = Number(balance.sol_price || 0);
+  const virtualSolRounded = Math.round(virtualSol * 1e6) / 1e6;
+  const virtualSolUsd = solPrice > 0 ? Math.round(virtualSolRounded * solPrice * 100) / 100 : balance.sol_usd;
+  const realSol = balance.sol;
+  return {
+    ...balance,
+    sol: virtualSolRounded,
+    sol_usd: virtualSolUsd,
+    total_usd: Math.max(Number(balance.total_usd || 0), virtualSolUsd || 0),
+    dry_run_virtual: true,
+    real_sol: realSol,
+    virtual_sol: virtualSolRounded,
+  };
+}
+
 function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
 }
@@ -98,7 +118,7 @@ export async function getWalletBalances() {
       usd: b.usdValue ? Math.round(b.usdValue * 100) / 100 : null,
     }));
 
-    return {
+    return applyDryRunVirtualSol({
       wallet: walletAddress,
       sol: Math.round(solBalance * 1e6) / 1e6,
       sol_price: Math.round(solPrice * 100) / 100,
@@ -106,10 +126,10 @@ export async function getWalletBalances() {
       usdc: Math.round(usdcBalance * 100) / 100,
       tokens: enrichedTokens,
       total_usd: Math.round((data.totalUsdValue || 0) * 100) / 100,
-    };
+    });
   } catch (error) {
     log("wallet_error", error.message);
-    return {
+    return applyDryRunVirtualSol({
       wallet: walletAddress,
       sol: 0,
       sol_price: 0,
@@ -118,7 +138,7 @@ export async function getWalletBalances() {
       tokens: [],
       total_usd: 0,
       error: error.message,
-    };
+    });
   }
 }
 

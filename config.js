@@ -34,6 +34,7 @@ const strategyDefaultBinsBelow = Math.max(
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
 if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
+if (u.llmProvider) process.env.LLM_PROVIDER    ||= u.llmProvider;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
@@ -110,6 +111,7 @@ export const config = {
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
+    dryRunVirtualSol:      u.dryRunVirtualSol      ?? 1,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
@@ -138,6 +140,9 @@ export const config = {
 
   // ─── LLM Settings ──────────────────────
   llm: {
+    provider:    u.llmProvider ?? process.env.LLM_PROVIDER ?? "openrouter",
+    baseUrl:     u.llmBaseUrl  ?? process.env.LLM_BASE_URL ?? "https://openrouter.ai/api/v1",
+    apiKey:      u.llmApiKey   ?? process.env.LLM_API_KEY ?? process.env.OPENROUTER_API_KEY ?? "",
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,

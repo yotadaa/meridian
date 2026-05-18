@@ -1,6 +1,7 @@
 {
   "preset": "custom",
   "rpcUrl": "https://pump.helius-rpc.com",
+  "llmProvider": "openrouter",
   "llmBaseUrl": "",
   "llmApiKey": "",
   "llmModel": "minimax/minimax-m2.7",
@@ -9,6 +10,7 @@
   "deployAmountSol": 0.5,
   "maxPositions": 3,
   "minSolToOpen": 0.55,
+  "dryRunVirtualSol": 1,
   "maxDeployAmount": 50,
   "gasReserve": 0.2,
   "positionSizePct": 0.35,
