@@ -695,7 +695,12 @@ async function runSafetyChecks(name, args) {
       }
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
       const fallbackBinsBelow = Math.max(minBinsBelow, Number(config.strategy.defaultBinsBelow ?? config.strategy.maxBinsBelow ?? minBinsBelow));
-      if (args.downside_pct == null && (!Number.isFinite(Number(args.bins_below)) || Number(args.bins_below) < minBinsBelow)) {
+      const downsidePct = Number(args.downside_pct ?? 0);
+      const upsidePct = Number(args.upside_pct ?? 0);
+      const hasMeaningfulPctRange =
+        (Number.isFinite(downsidePct) && downsidePct > 0) ||
+        (Number.isFinite(upsidePct) && upsidePct > 0);
+      if (!hasMeaningfulPctRange && (!Number.isFinite(Number(args.bins_below)) || Number(args.bins_below) < minBinsBelow)) {
         args.bins_below = fallbackBinsBelow;
       }
       const requestedBinsBelow = Number(args.bins_below);
@@ -710,8 +715,7 @@ async function runSafetyChecks(name, args) {
         };
       }
       if (
-        args.downside_pct == null &&
-        args.upside_pct == null &&
+        !hasMeaningfulPctRange &&
         (
           !Number.isFinite(requestedBinsBelow) ||
           !Number.isFinite(requestedBinsAbove) ||
@@ -729,7 +733,7 @@ async function runSafetyChecks(name, args) {
       }
       if (
         isSingleSidedSol &&
-        args.downside_pct == null &&
+        !hasMeaningfulPctRange &&
         (!Number.isFinite(requestedBinsBelow) || !Number.isInteger(requestedBinsBelow) || requestedBinsBelow < minBinsBelow)
       ) {
         return {

@@ -495,7 +495,13 @@ export async function deployPosition({
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
 
-  if (downside_pct != null || upside_pct != null) {
+  const parsedDownsidePct = downside_pct == null ? null : Number(downside_pct);
+  const parsedUpsidePct = upside_pct == null ? null : Number(upside_pct);
+  const hasMeaningfulPctRange =
+    (Number.isFinite(parsedDownsidePct) && parsedDownsidePct > 0) ||
+    (Number.isFinite(parsedUpsidePct) && parsedUpsidePct > 0);
+
+  if (hasMeaningfulPctRange) {
     const downsidePct = Math.max(0, Number(downside_pct ?? 0));
     const upsidePct = Math.max(0, Number(upside_pct ?? 0));
 
@@ -564,7 +570,7 @@ export async function deployPosition({
     throw new Error("Invalid bin range: bins_below and bins_above must be whole-bin integers.");
   }
   const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
-  if (downside_pct == null && activeBinsBelow < minBinsBelow) {
+  if (!hasMeaningfulPctRange && activeBinsBelow < minBinsBelow) {
     activeBinsBelow = Math.max(
       minBinsBelow,
       Number(config.strategy.defaultBinsBelow ?? config.strategy.maxBinsBelow ?? minBinsBelow),
