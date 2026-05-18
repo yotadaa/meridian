@@ -499,7 +499,16 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");
-  const { positions } = await getMyPositions();
+  const positionsResult = await getMyPositions({ silent: true });
+  if (positionsResult?.error) {
+    const message = `Position check unavailable during screening: ${positionsResult.error}`;
+    if (process.env.DRY_RUN === "true") {
+      log("screening_warn", `${message}; continuing in dry-run with no occupied-pool exclusions`);
+    } else {
+      throw new Error(`${message}; refusing live candidate scan`);
+    }
+  }
+  const positions = Array.isArray(positionsResult?.positions) ? positionsResult.positions : [];
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
   const minTvl = Number(config.screening.minTvl ?? 0);

@@ -440,7 +440,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
       : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
+    log("screening", "Fetching top candidates...");
+    const topCandidatesStartedAt = Date.now();
+    const topCandidates = await getTopCandidates({ limit: 10 }).catch((error) => {
+      log("screening_error", `getTopCandidates failed: ${error.message}`);
+      screenReport = `Screening candidate fetch failed: ${error.message}`;
+      return null;
+    });
+    log("screening", `Top candidate fetch finished in ${Math.round((Date.now() - topCandidatesStartedAt) / 1000)}s — candidates=${topCandidates?.candidates?.length ?? topCandidates?.pools?.length ?? 0}, total_screened=${topCandidates?.total_screened ?? "?"}`);
+    if (!topCandidates && screenReport) return screenReport;
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 
