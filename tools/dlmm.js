@@ -26,7 +26,7 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { getWalletBalances, normalizeMint } from "./wallet.js";
-import { closePaperPosition, getPaperPositions, openPaperPosition } from "./paper.js";
+import { closePaperPosition, estimatePaperPosition, getPaperPositions, openPaperPosition } from "./paper.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -612,6 +612,9 @@ export async function deployPosition({
       bins_above: activeBinsAbove,
       bin_step: actualBinStep,
       base_fee,
+      entry_price: activePrice,
+      fee_tvl_ratio,
+      volatility: normalizedVolatility,
     });
     _positionsCacheAt = 0;
     return {
@@ -1374,7 +1377,14 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       const paperPositions = getPaperPositions();
       const known = new Set(positions.map((p) => p.position));
       for (const paperPosition of paperPositions) {
-        if (!known.has(paperPosition.position)) positions.push(paperPosition);
+        if (known.has(paperPosition.position)) continue;
+        let market = {};
+        try {
+          const pool = await getPool(paperPosition.pool);
+          const activeBin = await pool.getActiveBin();
+          market = { active_bin: activeBin.binId };
+        } catch { /* paper mode can still use the last known active bin */ }
+        positions.push(estimatePaperPosition(paperPosition, market));
       }
     }
 

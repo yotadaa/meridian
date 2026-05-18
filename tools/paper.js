@@ -53,6 +53,64 @@ export function getPaperPositions() {
   }));
 }
 
+export function estimatePaperPosition(position, market = {}) {
+  const now = Date.now();
+  const openedAt = position.opened_at ? new Date(position.opened_at).getTime() : now;
+  const ageMinutes = Math.max(0, Math.floor((now - openedAt) / 60000));
+  const amountSol = Number(position.amount_sol || 0);
+  const lowerBin = Number(position.lower_bin);
+  const upperBin = Number(position.upper_bin);
+  const entryBin = Number(position.entry_active_bin ?? position.active_bin ?? upperBin);
+  const activeBin = Number(market.active_bin ?? position.active_bin ?? entryBin);
+  const binsBelow = Math.max(1, Number(position.bins_below || (entryBin - lowerBin) || 1));
+  const feeTvlRatio = Math.max(0, Number(position.fee_tvl_ratio ?? position.fee_per_tvl_24h ?? 0));
+  const baseFee = Math.max(0, Number(position.base_fee ?? 0));
+  const inRange = Number.isFinite(activeBin) && Number.isFinite(lowerBin) && Number.isFinite(upperBin)
+    ? activeBin >= lowerBin && activeBin <= upperBin
+    : true;
+
+  // Approximate directional inventory risk for single-side SOL DLMM paper positions.
+  const downsideBins = Number.isFinite(activeBin) && Number.isFinite(entryBin)
+    ? Math.max(0, entryBin - activeBin)
+    : 0;
+  const rangeFill = Math.min(1, downsideBins / binsBelow);
+  const belowRangeBins = Number.isFinite(activeBin) && Number.isFinite(lowerBin)
+    ? Math.max(0, lowerBin - activeBin)
+    : 0;
+  const inventoryPnlPct = -(rangeFill * 6) - Math.min(30, (belowRangeBins / binsBelow) * 20);
+
+  // Treat fee_tvl_ratio as a 24h fee yield proxy, scaled by age and base fee.
+  const ageDays = ageMinutes / 1440;
+  const feePct = Math.min(25, (feeTvlRatio + baseFee) * ageDays);
+  const pnlPct = Math.round((inventoryPnlPct + feePct) * 100) / 100;
+  const pnlSol = roundSol(amountSol * pnlPct / 100);
+  const feeSol = roundSol(amountSol * feePct / 100);
+  const valueSol = roundSol(amountSol + pnlSol);
+
+  return {
+    ...position,
+    active_bin: Number.isFinite(activeBin) ? activeBin : position.active_bin,
+    in_range: inRange,
+    age_minutes: ageMinutes,
+    minutes_out_of_range: inRange ? 0 : ageMinutes,
+    unclaimed_fees_usd: feeSol,
+    unclaimed_fees_true_usd: feeSol,
+    collected_fees_usd: position.collected_fees_usd ?? 0,
+    collected_fees_true_usd: position.collected_fees_true_usd ?? 0,
+    total_value_usd: valueSol,
+    total_value_true_usd: valueSol,
+    pnl_usd: pnlSol,
+    pnl_true_usd: pnlSol,
+    pnl_pct: pnlPct,
+    pnl_pct_derived: pnlPct,
+    fee_per_tvl_24h: feeTvlRatio || null,
+    paper_estimated: true,
+    paper_value_sol: valueSol,
+    paper_pnl_sol: pnlSol,
+    paper_fee_sol: feeSol,
+  };
+}
+
 export function openPaperPosition(details) {
   if (!isDryRun()) return null;
   const amount = Number(details.amount_sol || 0);
@@ -68,6 +126,8 @@ export function openPaperPosition(details) {
     lower_bin: details.lower_bin ?? null,
     upper_bin: details.upper_bin ?? null,
     active_bin: details.active_bin ?? null,
+    entry_active_bin: details.active_bin ?? null,
+    entry_price: details.entry_price ?? null,
     in_range: true,
     amount_sol: roundSol(amount),
     total_value_usd: null,
@@ -88,6 +148,8 @@ export function openPaperPosition(details) {
     bins_above: details.bins_above,
     bin_step: details.bin_step,
     base_fee: details.base_fee,
+    fee_tvl_ratio: details.fee_tvl_ratio ?? null,
+    volatility: details.volatility ?? null,
     opened_at: now,
   };
   state.sol = roundSol(state.sol - amount);
@@ -103,10 +165,22 @@ export function closePaperPosition(position_address, { reason } = {}) {
   const index = state.positions.findIndex((p) => p.position === position_address);
   if (index < 0) return { found: false };
   const [position] = state.positions.splice(index, 1);
-  const amount = roundSol(position.amount_sol || 0);
+  const estimated = estimatePaperPosition(position);
+  const amount = roundSol(estimated.paper_value_sol ?? position.amount_sol ?? 0);
   const now = new Date().toISOString();
   state.sol = roundSol(state.sol + amount);
-  state.history.push({ type: "close", at: now, amount_sol: amount, position: position.position, pool: position.pool, reason: reason || null });
+  state.history.push({
+    type: "close",
+    at: now,
+    amount_sol: amount,
+    returned_sol: amount,
+    pnl_sol: estimated.paper_pnl_sol ?? 0,
+    pnl_pct: estimated.pnl_pct ?? 0,
+    fees_sol: estimated.paper_fee_sol ?? 0,
+    position: position.position,
+    pool: position.pool,
+    reason: reason || null,
+  });
   savePaperState(state);
-  return { found: true, position, returned_sol: amount, balance_sol: state.sol };
+  return { found: true, position: estimated, returned_sol: amount, balance_sol: state.sol };
 }
