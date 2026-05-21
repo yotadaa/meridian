@@ -26,7 +26,7 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { getWalletBalances, normalizeMint } from "./wallet.js";
-import { closePaperPosition, estimatePaperPosition, getPaperPositions, openPaperPosition } from "./paper.js";
+import { claimPaperFees, closePaperPosition, estimatePaperPosition, getPaperPositions, openPaperPosition } from "./paper.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -596,6 +596,18 @@ export async function deployPosition({
     );
   }
 
+  const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
+  const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());
+  const downsideCoveragePct = activePrice > 0 ? ((activePrice - minPrice) / activePrice) * 100 : null;
+  const upsideCoveragePct = activePrice > 0 ? ((maxPrice - activePrice) / activePrice) * 100 : null;
+  const totalWidthPct = minPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null;
+  const reportedDownsidePct = Number(downside_pct) > 0 ? Number(downside_pct) : downsideCoveragePct;
+  const reportedUpsidePct = Number(upside_pct) > 0 ? Number(upside_pct) : upsideCoveragePct;
+
+  // Read base fee directly from pool — baseFactor * binStep / 10^6 gives fee in %
+  const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;
+  const actualBaseFee = base_fee ?? (baseFactor > 0 ? parseFloat((baseFactor * actualBinStep / 1e6 * 100).toFixed(4)) : null);
+
   if (process.env.DRY_RUN === "true") {
     const paper = openPaperPosition({
       pool_address,
@@ -640,8 +652,9 @@ export async function deployPosition({
         active_bin: activeBin.binId,
         min_bin: minBinId,
         max_bin: maxBinId,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
+        downside_pct: reportedDownsidePct,
+        upside_pct: reportedUpsidePct,
+        width_pct: totalWidthPct,
         paper: true,
       },
     });
@@ -655,28 +668,34 @@ export async function deployPosition({
         pool_address,
         strategy: activeStrategy,
         bins_below: activeBinsBelow,
-        bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-        amount_x: finalAmountX,
-        amount_y: finalAmountY,
-        wide_range: isWideRange,
+          bins_above: activeBinsAbove,
+          downside_pct: reportedDownsidePct,
+          upside_pct: reportedUpsidePct,
+          amount_x: finalAmountX,
+          amount_y: finalAmountY,
+          wide_range: isWideRange,
       },
+      pool: pool_address,
+      pool_name,
+      bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
+      price_range: { min: minPrice, max: maxPrice },
+      range_coverage: {
+        downside_pct: reportedDownsidePct,
+        upside_pct: reportedUpsidePct,
+        width_pct: totalWidthPct,
+        active_price: activePrice,
+      },
+      bin_step: actualBinStep,
+      base_fee: actualBaseFee,
+      strategy: activeStrategy,
+      wide_range: isWideRange,
+      amount_x: finalAmountX,
+      amount_y: finalAmountY,
       message: "DRY RUN — paper position opened; no transaction sent",
     };
   }
 
   await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
-
-  const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
-  const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());
-  const downsideCoveragePct = activePrice > 0 ? ((activePrice - minPrice) / activePrice) * 100 : null;
-  const upsideCoveragePct = activePrice > 0 ? ((maxPrice - activePrice) / activePrice) * 100 : null;
-  const totalWidthPct = minPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null;
-
-  // Read base fee directly from pool — baseFactor * binStep / 10^6 gives fee in %
-  const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;
-  const actualBaseFee = base_fee ?? (baseFactor > 0 ? parseFloat((baseFactor * actualBinStep / 1e6 * 100).toFixed(4)) : null);
 
   const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
   // Token X amount uses mint decimals when available, falling back to 9.
@@ -788,8 +807,8 @@ export async function deployPosition({
           active_bin: activeBin.binId,
           min_bin: minBinId,
           max_bin: maxBinId,
-          downside_pct: downside_pct ?? downsideCoveragePct,
-          upside_pct: upside_pct ?? upsideCoveragePct,
+          downside_pct: reportedDownsidePct,
+          upside_pct: reportedUpsidePct,
         },
       });
 
@@ -803,8 +822,8 @@ export async function deployPosition({
         bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
         price_range: { min: minPrice, max: maxPrice },
         range_coverage: {
-          downside_pct: downsideCoveragePct,
-          upside_pct: upsideCoveragePct,
+          downside_pct: reportedDownsidePct,
+          upside_pct: reportedUpsidePct,
           width_pct: totalWidthPct,
           active_price: activePrice,
         },
@@ -925,8 +944,8 @@ export async function deployPosition({
         active_bin: activeBin.binId,
         min_bin: minBinId,
         max_bin: maxBinId,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
+        downside_pct: reportedDownsidePct,
+        upside_pct: reportedUpsidePct,
       },
     });
 
@@ -938,8 +957,8 @@ export async function deployPosition({
       bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
       price_range: { min: minPrice, max: maxPrice },
       range_coverage: {
-        downside_pct: downsideCoveragePct,
-        upside_pct: upsideCoveragePct,
+        downside_pct: reportedDownsidePct,
+        upside_pct: reportedUpsidePct,
         width_pct: totalWidthPct,
         active_price: activePrice,
       },
@@ -1538,7 +1557,21 @@ export async function searchPools({ query, limit = 10 }) {
 export async function claimFees({ position_address }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
-    return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
+    const paper = claimPaperFees(position_address);
+    if (paper?.found) {
+      recordClaim(position_address);
+      return {
+        success: true,
+        dry_run: true,
+        position: position_address,
+        claimed_sol: paper.claimed_sol,
+        paper_balance_sol: paper.balance_sol,
+        message: paper.claimed_sol > 0
+          ? "DRY RUN — paper fees claimed; no transaction sent"
+          : "DRY RUN — no paper fees available to claim",
+      };
+    }
+    return { dry_run: true, would_claim: position_address, message: "DRY RUN — no matching paper position; no transaction sent" };
   }
 
   const tracked = getTrackedPosition(position_address);

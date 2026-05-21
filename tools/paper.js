@@ -63,6 +63,7 @@ export function estimatePaperPosition(position, market = {}) {
   const entryBin = Number(position.entry_active_bin ?? position.active_bin ?? upperBin);
   const activeBin = Number(market.active_bin ?? position.active_bin ?? entryBin);
   const binsBelow = Math.max(1, Number(position.bins_below || (entryBin - lowerBin) || 1));
+  const binStep = Number(position.bin_step ?? 0);
   const feeTvlRatio = Math.max(0, Number(position.fee_tvl_ratio ?? position.fee_per_tvl_24h ?? 0));
   const baseFee = Math.max(0, Number(position.base_fee ?? 0));
   const inRange = Number.isFinite(activeBin) && Number.isFinite(lowerBin) && Number.isFinite(upperBin)
@@ -74,18 +75,31 @@ export function estimatePaperPosition(position, market = {}) {
     ? Math.max(0, entryBin - activeBin)
     : 0;
   const rangeFill = Math.min(1, downsideBins / binsBelow);
-  const belowRangeBins = Number.isFinite(activeBin) && Number.isFinite(lowerBin)
-    ? Math.max(0, lowerBin - activeBin)
-    : 0;
-  const inventoryPnlPct = -(rangeFill * 6) - Math.min(30, (belowRangeBins / binsBelow) * 20);
+  const step = Number.isFinite(binStep) && binStep > 0 ? binStep / 10_000 : null;
+  const priceRatio = step && Number.isFinite(activeBin) && Number.isFinite(entryBin)
+    ? Math.pow(1 + step, activeBin - entryBin)
+    : Math.max(0, 1 - rangeFill * 0.06);
+
+  // Approximate single-side SOL inventory: as price moves down through the range,
+  // some SOL is converted into the base token and marked to the current bin price.
+  // This is still a paper model, but it tracks virtual token exposure instead of
+  // applying only a fixed penalty curve.
+  const solInventory = roundSol(amountSol * (1 - rangeFill));
+  const baseEntryValueSol = roundSol(amountSol * rangeFill);
+  const baseCurrentValueSol = roundSol(baseEntryValueSol * priceRatio);
+  const inventoryValueSol = roundSol(solInventory + baseCurrentValueSol);
+  const inventoryPnlSol = roundSol(inventoryValueSol - amountSol);
+  const inventoryPnlPct = amountSol > 0 ? (inventoryPnlSol / amountSol) * 100 : 0;
 
   // Treat fee_tvl_ratio as a 24h fee yield proxy, scaled by age and base fee.
   const ageDays = ageMinutes / 1440;
   const feePct = Math.min(25, (feeTvlRatio + baseFee) * ageDays);
-  const feeYieldPct = amountSol > 0 ? Math.round((feeSolFromPct(amountSol, feePct) / amountSol) * 10000) / 100 : 0;
-  const pnlPct = Math.round((inventoryPnlPct + feePct) * 100) / 100;
-  const pnlSol = roundSol(amountSol * pnlPct / 100);
-  const feeSol = roundSol(amountSol * feePct / 100);
+  const grossFeeSol = roundSol(amountSol * feePct / 100);
+  const claimedFeeSol = Math.max(0, Number(position.claimed_fee_sol ?? 0));
+  const feeSol = roundSol(Math.max(0, grossFeeSol - claimedFeeSol));
+  const feeYieldPct = amountSol > 0 ? Math.round((feeSol / amountSol) * 10000) / 100 : 0;
+  const pnlSol = roundSol(inventoryPnlSol + feeSol);
+  const pnlPct = amountSol > 0 ? Math.round((pnlSol / amountSol) * 10000) / 100 : 0;
   const valueSol = roundSol(amountSol + pnlSol);
 
   return {
@@ -96,8 +110,8 @@ export function estimatePaperPosition(position, market = {}) {
     minutes_out_of_range: inRange ? 0 : ageMinutes,
     unclaimed_fees_usd: feeSol,
     unclaimed_fees_true_usd: feeSol,
-    collected_fees_usd: position.collected_fees_usd ?? 0,
-    collected_fees_true_usd: position.collected_fees_true_usd ?? 0,
+    collected_fees_usd: claimedFeeSol,
+    collected_fees_true_usd: claimedFeeSol,
     total_value_usd: valueSol,
     total_value_true_usd: valueSol,
     pnl_usd: pnlSol,
@@ -111,6 +125,15 @@ export function estimatePaperPosition(position, market = {}) {
     paper_value_sol: valueSol,
     paper_pnl_sol: pnlSol,
     paper_fee_sol: feeSol,
+    paper_gross_fee_sol: grossFeeSol,
+    paper_claimed_fee_sol: claimedFeeSol,
+    paper_inventory: {
+      sol_inventory: solInventory,
+      base_entry_value_sol: baseEntryValueSol,
+      base_current_value_sol: baseCurrentValueSol,
+      range_fill_pct: Math.round(rangeFill * 10000) / 100,
+      price_ratio: Math.round(priceRatio * 10000) / 10000,
+    },
   };
 }
 
@@ -143,6 +166,7 @@ export function openPaperPosition(details) {
     unclaimed_fees_true_usd: 0,
     collected_fees_usd: 0,
     collected_fees_true_usd: 0,
+    claimed_fee_sol: 0,
     pnl_usd: 0,
     pnl_true_usd: 0,
     pnl_pct: 0,
@@ -164,6 +188,44 @@ export function openPaperPosition(details) {
   state.history.push({ type: "open", at: now, amount_sol: amount, position: position.position, pool: position.pool });
   savePaperState(state);
   return { position, balance_sol: state.sol };
+}
+
+export function claimPaperFees(position_address, market = {}) {
+  if (!isDryRun()) return null;
+  const state = loadPaperState();
+  const index = state.positions.findIndex((p) => p.position === position_address);
+  if (index < 0) return { found: false };
+
+  const position = state.positions[index];
+  const estimated = estimatePaperPosition(position, market);
+  const fees = roundSol(estimated.paper_fee_sol ?? 0);
+  const now = new Date().toISOString();
+
+  if (fees <= 0) {
+    return { found: true, claimed_sol: 0, position: estimated, balance_sol: roundSol(state.sol) };
+  }
+
+  position.claimed_fee_sol = roundSol(Number(position.claimed_fee_sol ?? 0) + fees);
+  position.collected_fees_usd = position.claimed_fee_sol;
+  position.collected_fees_true_usd = position.claimed_fee_sol;
+  position.last_claimed_at = now;
+  state.positions[index] = position;
+  state.sol = roundSol(state.sol + fees);
+  state.history.push({
+    type: "claim",
+    at: now,
+    claimed_sol: fees,
+    position: position.position,
+    pool: position.pool,
+  });
+  savePaperState(state);
+
+  return {
+    found: true,
+    claimed_sol: fees,
+    position: estimatePaperPosition(position, market),
+    balance_sol: state.sol,
+  };
 }
 
 export function closePaperPosition(position_address, { reason } = {}) {

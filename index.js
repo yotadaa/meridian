@@ -23,7 +23,7 @@ import {
   notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
-} from "./telegram.js";
+} from "./communication.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
@@ -48,9 +48,6 @@ if (isMain) {
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
 }
-
-const TP_PCT = config.management.takeProfitPct;
-const DEPLOY = config.management.deployAmountSol;
 
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
@@ -476,6 +473,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
   }
   _screeningBusy = true; // set immediately — prevents TOCTOU race with concurrent callers
   _screeningLastTriggered = Date.now();
+  // Update prompt/schedule accounting on every screening attempt, including
+  // intentional pre-check skips (max positions, insufficient balance, etc.).
+  // Otherwise the REPL can show "screen: now" forever even though screening
+  // was just attempted and skipped safely.
+  timers.screeningLastRun = Date.now();
 
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
@@ -495,16 +497,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
-    const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-    const isDryRun = process.env.DRY_RUN === "true";
-    if (!isDryRun && preBalance.sol < minRequired) {
-      log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
+    const deployAmount = Number(config.management.deployAmountSol ?? 0);
+    const gasReserve = Number(config.management.gasReserve ?? 0);
+    const minSolToOpen = Number(config.management.minSolToOpen ?? 0);
+    const minRequired = Math.max(minSolToOpen, deployAmount + gasReserve);
+    if (Number(preBalance.sol) < minRequired) {
+      const balanceLabel = preBalance.dry_run_virtual ? "paper SOL" : "SOL";
+      log("cron", `Screening skipped — insufficient ${balanceLabel} (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + reserve)`);
+      screenReport = `Screening skipped — insufficient ${balanceLabel} (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + reserve).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
+        reason: `Insufficient ${balanceLabel} (${preBalance.sol.toFixed(3)} < ${minRequired})`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -735,7 +740,7 @@ STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
+   bins_below targets downside price coverage using candidate bin_step and volatility, clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
@@ -1011,7 +1016,7 @@ function formatCandidates(candidates) {
   ].join("\n");
 }
 
-function getDeterministicCloseRule(position, managementConfig) {
+export function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
     if (position.pnl_pct == null) return false;
@@ -1038,6 +1043,15 @@ function getDeterministicCloseRule(position, managementConfig) {
   }
   if (
     position.active_bin != null &&
+    position.lower_bin != null &&
+    managementConfig.downsideOutOfRangeBinsToClose != null &&
+    position.active_bin < position.lower_bin - managementConfig.downsideOutOfRangeBinsToClose &&
+    (position.minutes_out_of_range ?? 0) >= (managementConfig.downsideOutOfRangeWaitMinutes ?? managementConfig.outOfRangeWaitMinutes)
+  ) {
+    return { action: "CLOSE", rule: 3.5, reason: "dumped far below range" };
+  }
+  if (
+    position.active_bin != null &&
     position.upper_bin != null &&
     position.active_bin > position.upper_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
@@ -1047,7 +1061,7 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
+    (position.age_minutes ?? 0) >= (managementConfig.minAgeBeforeYieldCheck ?? 60)
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }
@@ -1455,7 +1469,7 @@ async function deployLatestCandidate(index) {
     }
   }
   const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility);
+  const binsBelow = computeBinsBelow(candidate.volatility, candidate.bin_step);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
     amount_y: deployAmount,
@@ -1814,14 +1828,31 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   return null;
 }
 
-function computeBinsBelow(volatility) {
+function clampNumber(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function binsForDownsidePct(binStep, downsidePct) {
+  const step = Number(binStep) / 10_000;
+  if (!Number.isFinite(step) || step <= 0) return null;
+  const safeDownside = clampNumber(Number(downsidePct), 0.01, 0.95);
+  return Math.ceil(Math.log(1 / (1 - safeDownside)) / Math.log(1 + step));
+}
+
+function computeBinsBelow(volatility, binStep) {
   const parsedVolatility = Number(volatility);
   if (!Number.isFinite(parsedVolatility) || parsedVolatility <= 0) {
     throw new Error(`Invalid volatility ${volatility ?? "unknown"} — refusing volatility-scaled deploy.`);
   }
   const lo = config.strategy.minBinsBelow;
   const hi = config.strategy.maxBinsBelow;
-  return Math.max(lo, Math.min(hi, Math.round(lo + (parsedVolatility / 5) * (hi - lo))));
+  const volNorm = clampNumber(parsedVolatility / 5, 0, 1);
+  const targetDownsidePct = 0.25 + volNorm * 0.30;
+  const rawBins = binsForDownsidePct(binStep, targetDownsidePct);
+  if (rawBins == null) {
+    return Math.max(lo, Math.min(hi, Math.round(lo + volNorm * (hi - lo))));
+  }
+  return Math.max(lo, Math.min(hi, rawBins));
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
@@ -1912,7 +1943,7 @@ if (isMain && isTTY) {
 
   console.log(`
 Commands:
-  1 / 2 / 3 ...  Deploy ${DEPLOY} SOL into that pool
+  1 / 2 / 3 ...  Deploy current configured SOL amount into that pool
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
@@ -1936,9 +1967,10 @@ Commands:
     if (!isNaN(pick) && pick >= 1 && pick <= latest.length) {
       await runBusy(async () => {
         const pool = latest[pick - 1];
-        console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
+        const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+        console.log(`\nDeploying ${deployAmount} SOL into ${pool.name}...\n`);
         const { content: reply } = await agentLoop(
-          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${deployAmount} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -1954,7 +1986,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_above=0, and bins_below from positive volatility. Execute now, don't ask.`,
+          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, compute the deploy amount from current wallet/config, use amount_x=0, bins_above=0, and bins_below from positive volatility. Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"

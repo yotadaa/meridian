@@ -371,6 +371,8 @@ export function getStateSummary() {
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
   const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
+  const activeBin = Number(positionData.active_bin);
+  const lowerBin = Number(positionData.lower_bin);
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
@@ -435,6 +437,20 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
+    const downsideBinsToClose = mgmtConfig.downsideOutOfRangeBinsToClose ?? null;
+    const downsideWaitMinutes = mgmtConfig.downsideOutOfRangeWaitMinutes ?? mgmtConfig.outOfRangeWaitMinutes;
+    if (
+      downsideBinsToClose != null &&
+      Number.isFinite(activeBin) &&
+      Number.isFinite(lowerBin) &&
+      activeBin < lowerBin - downsideBinsToClose &&
+      minutesOOR >= downsideWaitMinutes
+    ) {
+      return {
+        action: "DOWNSIDE_OUT_OF_RANGE",
+        reason: `Downside OOR: active bin ${activeBin} is ${lowerBin - activeBin} bins below lower bin ${lowerBin} (limit: ${downsideBinsToClose}; OOR ${minutesOOR}m >= ${downsideWaitMinutes}m)`,
+      };
+    }
     if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
       return {
         action: "OUT_OF_RANGE",

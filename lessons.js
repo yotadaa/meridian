@@ -327,9 +327,12 @@ export function evolveThresholds(perfData, config) {
   {
     const winnerVols = winners.map((p) => p.volatility).filter(isFiniteNum);
     const loserVols  = losers.map((p) => p.volatility).filter(isFiniteNum);
-    const current    = config.screening.maxVolatility;
+    const configuredMaxVolatility = config.screening.maxVolatility;
+    const current = configuredMaxVolatility == null
+      ? (loserVols.length >= 2 ? Math.max(...loserVols) : null)
+      : configuredMaxVolatility;
 
-    if (loserVols.length >= 2) {
+    if (current != null && loserVols.length >= 2) {
       // 25th percentile of loser volatilities — this is where things start going wrong
       const loserP25 = percentile(loserVols, 25);
       if (loserP25 < current) {
@@ -342,7 +345,7 @@ export function evolveThresholds(perfData, config) {
           rationale.maxVolatility = `Losers clustered at volatility ~${loserP25.toFixed(1)} — tightened from ${current} → ${rounded}`;
         }
       }
-    } else if (winnerVols.length >= 3 && losers.length === 0) {
+    } else if (current != null && configuredMaxVolatility != null && winnerVols.length >= 3 && losers.length === 0) {
       // All winners so far — loosen conservatively so we don't miss good pools
       const winnerP75 = percentile(winnerVols, 75);
       if (winnerP75 > current * 1.1) {
@@ -357,14 +360,14 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
-  // ── 2. minFeeTvlRatio ─────────────────────────────────────────
+  // ── 2. minFeeActiveTvlRatio ───────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
-    const current    = config.screening.minFeeTvlRatio;
+    const current    = config.screening.minFeeActiveTvlRatio;
 
-    if (winnerFees.length >= 2) {
+    if (isFiniteNum(current) && winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
       const minWinnerFee = Math.min(...winnerFees);
       if (minWinnerFee > current * 1.2) {
@@ -372,13 +375,13 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
         const rounded = Number(newVal.toFixed(2));
         if (rounded > current) {
-          changes.minFeeTvlRatio = rounded;
-          rationale.minFeeTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
+          changes.minFeeActiveTvlRatio = rounded;
+          rationale.minFeeActiveTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
         }
       }
     }
 
-    if (loserFees.length >= 2) {
+    if (isFiniteNum(current) && loserFees.length >= 2) {
       // If losers all had high fee/TVL, that's noise (pumps then crash) — don't raise min
       // But if losers had low fee/TVL, raise min
       const maxLoserFee = Math.max(...loserFees);
@@ -388,9 +391,9 @@ export function evolveThresholds(perfData, config) {
           const target  = maxLoserFee * 1.2;
           const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
           const rounded = Number(newVal.toFixed(2));
-          if (rounded > current && !changes.minFeeTvlRatio) {
-            changes.minFeeTvlRatio = rounded;
-            rationale.minFeeTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
+          if (rounded > current && !changes.minFeeActiveTvlRatio) {
+            changes.minFeeActiveTvlRatio = rounded;
+            rationale.minFeeActiveTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
           }
         }
       }
@@ -438,7 +441,7 @@ export function evolveThresholds(perfData, config) {
   // Apply to live config object immediately
   const s = config.screening;
   if (changes.maxVolatility    != null) s.maxVolatility    = changes.maxVolatility;
-  if (changes.minFeeTvlRatio   != null) s.minFeeTvlRatio   = changes.minFeeTvlRatio;
+  if (changes.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = changes.minFeeActiveTvlRatio;
   if (changes.minOrganic       != null) s.minOrganic       = changes.minOrganic;
 
   // Log a lesson summarizing the evolution
@@ -608,6 +611,7 @@ const ROLE_TAGS = {
   MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim"],
   GENERAL:  [], // all lessons
 };
+const CRITICAL_TAGS = ["killer", "rug", "volatility", "fee_tvl", "fee-tvl", "blacklist", "stop_loss", "stop-loss", "discord_signal", "discord", "bundler", "holders", "oor", "low_yield", "low-yield"];
 
 /**
  * Get lessons formatted for injection into the system prompt.
@@ -629,11 +633,12 @@ export function getLessonsForPrompt(opts = {}) {
   const data = load();
   if (data.lessons.length === 0) return null;
 
-  // Smaller caps for automated cycles — they don't need the full lesson history
+  // Automated cycles need enough history to avoid repeating prior bad entries.
   const isAutoCycle = agentType === "SCREENER" || agentType === "MANAGER";
-  const PINNED_CAP  = isAutoCycle ? 5  : 10;
-  const ROLE_CAP    = isAutoCycle ? 6  : 15;
-  const RECENT_CAP  = maxLessons ?? (isAutoCycle ? 10 : 35);
+  const PINNED_CAP  = isAutoCycle ? 10 : 10;
+  const CRITICAL_CAP = isAutoCycle ? 10 : 15;
+  const ROLE_CAP    = isAutoCycle ? 12 : 15;
+  const RECENT_CAP  = maxLessons ?? (isAutoCycle ? 30 : 35);
 
   const outcomePriority = { bad: 0, poor: 1, failed: 1, good: 2, worked: 2, manual: 1, neutral: 3, evolution: 2 };
   const byPriority = (a, b) => (outcomePriority[a.outcome] ?? 3) - (outcomePriority[b.outcome] ?? 3);
@@ -646,6 +651,21 @@ export function getLessonsForPrompt(opts = {}) {
     .slice(0, PINNED_CAP);
 
   const usedIds = new Set(pinned.map((l) => l.id));
+
+  // ── Tier 1.5: Critical incident-prevention lessons ───────────────
+  const critical = data.lessons
+    .filter((l) => {
+      if (usedIds.has(l.id)) return false;
+      const roleOk = !l.role || l.role === agentType || agentType === "GENERAL";
+      const tags = Array.isArray(l.tags) ? l.tags.map((t) => String(t).toLowerCase()) : [];
+      const rule = String(l.rule || "").toLowerCase();
+      const criticalOk = CRITICAL_TAGS.some((tag) => tags.includes(tag) || rule.includes(tag.replace(/[-_]/g, " ")) || rule.includes(tag));
+      return roleOk && criticalOk;
+    })
+    .sort(byPriority)
+    .slice(0, CRITICAL_CAP);
+
+  critical.forEach((l) => usedIds.add(l.id));
 
   // ── Tier 2: Role-matched ────────────────────────────────────────
   const roleTags = ROLE_TAGS[agentType] || [];
@@ -664,7 +684,7 @@ export function getLessonsForPrompt(opts = {}) {
   roleMatched.forEach((l) => usedIds.add(l.id));
 
   // ── Tier 3: Recent fill ─────────────────────────────────────────
-  const remainingBudget = RECENT_CAP - pinned.length - roleMatched.length;
+  const remainingBudget = RECENT_CAP - pinned.length - critical.length - roleMatched.length;
   const recent = remainingBudget > 0
     ? data.lessons
         .filter((l) => !usedIds.has(l.id))
@@ -672,7 +692,7 @@ export function getLessonsForPrompt(opts = {}) {
         .slice(0, remainingBudget)
     : [];
 
-  const selected = [...pinned, ...roleMatched, ...recent];
+  const selected = [...pinned, ...critical, ...roleMatched, ...recent];
   const shared = getSharedLessonsForPrompt({
     agentType,
     maxLessons: isAutoCycle ? 4 : 6,
@@ -681,9 +701,12 @@ export function getLessonsForPrompt(opts = {}) {
 
   const sections = [];
   if (pinned.length)      sections.push(`── PINNED (${pinned.length}) ──\n` + fmt(pinned));
+  if (critical.length)    sections.push(`── CRITICAL (${critical.length}) ──\n` + fmt(critical));
   if (roleMatched.length) sections.push(`── ${agentType} (${roleMatched.length}) ──\n` + fmt(roleMatched));
   if (recent.length)      sections.push(`── RECENT (${recent.length}) ──\n` + fmt(recent));
   if (shared)             sections.push(`── HIVEMIND ──\n${shared}`);
+
+  log("lessons", `Injected lessons for ${agentType}: pinned=${pinned.length}, critical=${critical.length}, role=${roleMatched.length}, recent=${recent.length}, shared=${shared ? "yes" : "no"}`);
 
   return sections.join("\n\n");
 }

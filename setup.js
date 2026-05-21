@@ -13,6 +13,7 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, "user-config.json");
 const ENV_PATH    = path.join(__dirname, ".env");
+const WHATSAPP_SESSION_DIR = path.join(__dirname, ".wwebjs_auth", "session-meridian");
 
 const DEFAULT_MODEL = "openai/gpt-oss-20b:free";
 
@@ -167,7 +168,61 @@ const heliusKey = await ask(
   alreadySet(ev("HELIUS_API_KEY", ""))
 );
 
-// ─── Section 2: Telegram ──────────────────────────────────────────────────────
+// ─── Section 2: Communication Channel ─────────────────────────────────────────
+console.log("\n── Communication Channel ─────────────────────────────────────");
+
+const channelChoice = await askChoice("Preferred Channel:", [
+  { label: "Telegram", key: "telegram" },
+  { label: "WhatsApp", key: "whatsapp" },
+]);
+const preferredChannel = channelChoice.key;
+
+let whatsappChatId = e("whatsappChatId", ev("WHATSAPP_CHAT_ID", ""));
+if (preferredChannel === "whatsapp") {
+  console.log("\n── WhatsApp ──────────────────────────────────────────────────");
+  if (fs.existsSync(WHATSAPP_SESSION_DIR)) {
+    const updateSession = await askBool("Existing WhatsApp session found. Update/rebind it?", false);
+    if (updateSession) {
+      fs.rmSync(WHATSAPP_SESSION_DIR, { recursive: true, force: true });
+      console.log("  Removed old WhatsApp session. A new QR code will be shown below.");
+    } else {
+      console.log("  Keeping existing WhatsApp session.");
+    }
+  }
+  whatsappChatId = await ask("WhatsApp chat ID (optional — first inbound message will auto-link)", whatsappChatId);
+  const shouldBind = !fs.existsSync(WHATSAPP_SESSION_DIR) || await askBool("Show WhatsApp QR code now?", true);
+  if (shouldBind) {
+    console.log("\nStarting WhatsApp QR binding. Scan the QR code with WhatsApp Linked Devices.");
+    try {
+      const [whatsappWeb, qrcode] = await Promise.all([
+        import("whatsapp-web.js"),
+        import("qrcode-terminal"),
+      ]);
+      const { Client, LocalAuth } = whatsappWeb.default || whatsappWeb;
+      const client = new Client({
+        authStrategy: new LocalAuth({ clientId: "meridian" }),
+        puppeteer: { headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] },
+      });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("WhatsApp QR binding timed out after 2 minutes")), 120000);
+        client.on("qr", (qr) => qrcode.default.generate(qr, { small: true }));
+        client.on("ready", async () => {
+          clearTimeout(timer);
+          console.log("  ✓ WhatsApp session ready.");
+          await client.destroy();
+          resolve();
+        });
+        client.on("auth_failure", (message) => { clearTimeout(timer); reject(new Error(message)); });
+        client.initialize().catch((error) => { clearTimeout(timer); reject(error); });
+      });
+    } catch (error) {
+      console.log(`  ⚠ WhatsApp binding skipped/failed: ${error.message}`);
+      console.log("  Install dependencies with npm install, then run npm run setup again to bind.");
+    }
+  }
+}
+
+// ─── Section 2b: Telegram ─────────────────────────────────────────────────────
 console.log("\n── Telegram (optional — skip to disable) ─────────────────────");
 
 const telegramToken = await ask(
@@ -398,6 +453,9 @@ rl.close();
 
 // ─── Write .env ───────────────────────────────────────────────────────────────
 const isKept = (val) => !val || val.startsWith("***");
+if (!isKept(walletKey)) {
+  console.log("\n⚠ SECURITY: Your private key will be written to .env. Never paste .env, user-config.json, logs, or screenshots containing keys into AI chats or support channels.\n");
+}
 
 const envMap = {
   ...existingEnv,
@@ -406,6 +464,8 @@ const envMap = {
   ...(isKept(heliusKey)     ? {} : { HELIUS_API_KEY: heliusKey }),
   ...(isKept(telegramToken) ? {} : { TELEGRAM_BOT_TOKEN: telegramToken }),
   ...(telegramChatId        ? { TELEGRAM_CHAT_ID: telegramChatId } : {}),
+  PREFERRED_CHANNEL: preferredChannel,
+  ...(whatsappChatId ? { WHATSAPP_CHAT_ID: whatsappChatId } : {}),
   LLM_PROVIDER: provider.key,
   LLM_BASE_URL: llmBaseUrl,
   ...(llmApiKey ? { LLM_API_KEY: llmApiKey } : {}),
@@ -445,12 +505,15 @@ const userConfig = {
   llmBaseUrl,
   llmModel,
   ...(llmApiKey ? { llmApiKey } : {}),
+  preferredChannel,
+  whatsappChatId: whatsappChatId || "",
   telegramChatId: telegramChatId || "",
   dryRun,
 };
 
 // Remove legacy key if present
 delete userConfig.emergencyPriceDropPct;
+delete userConfig.walletKey;
 
 fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
@@ -479,7 +542,9 @@ console.log(`
   Model:        ${llmModel}
   Base URL:     ${llmBaseUrl}
 
+  Channel:      ${preferredChannel}
   Telegram:     ${telegramToken ? "enabled" : "disabled"}
+  WhatsApp:     ${preferredChannel === "whatsapp" ? "enabled" : "disabled"}
   .env:         ${ENV_PATH}
   Config:       ${CONFIG_PATH}
 

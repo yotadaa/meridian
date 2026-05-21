@@ -43,7 +43,7 @@ function numeric(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-function isUsableVolatility(value) {
+export function isUsableVolatility(value) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0;
 }
@@ -115,6 +115,9 @@ function getRawPoolScreeningRejectReason(pool, s) {
   }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
+  }
+  if (s.maxVolatility != null && volatility > s.maxVolatility) {
+    return `volatility ${volatility} above maxVolatility ${s.maxVolatility}`;
   }
   if (baseOrganic == null || baseOrganic < s.minOrganic) {
     return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;

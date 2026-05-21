@@ -6,6 +6,8 @@ const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 const currentLevel = LEVELS[LOG_LEVEL] || 1;
+const SECRET_KEY_RE = /(private|secret|apikey|api_key|api-key|token|walletkey|wallet_key|wallet-private-key|wallet_private_key|WALLET_PRIVATE_KEY|authorization|password|passphrase)/i;
+const SECRET_VALUE_RE = /\b(?:[1-9A-HJ-NP-Za-km-z]{80,}|sk-[A-Za-z0-9_-]{16,}|or-[A-Za-z0-9_-]{16,})\b/g;
 
 // Ensure log directory exists
 if (!fs.existsSync(LOG_DIR)) {
@@ -34,6 +36,20 @@ export function log(category, message) {
   fs.appendFileSync(logFile, line + "\n");
 }
 
+export function redactSecrets(value, depth = 0) {
+  if (depth > 12) return "[REDACTED:MAX_DEPTH]";
+  if (value == null) return value;
+  if (typeof value === "string") return value.replace(SECRET_VALUE_RE, "[REDACTED]");
+  if (typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((entry) => redactSecrets(entry, depth + 1));
+
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    out[key] = SECRET_KEY_RE.test(key) ? "[REDACTED]" : redactSecrets(entry, depth + 1);
+  }
+  return out;
+}
+
 /**
  * Log a tool action with full details (for audit trail).
  */
@@ -60,7 +76,7 @@ function actionHint(action) {
 export function logAction(action) {
   const timestamp = new Date().toISOString();
 
-  const entry = { timestamp, ...action };
+  const entry = redactSecrets({ timestamp, ...action });
 
   // Console: single clean line, no raw JSON
   const status = action.success ? "✓" : "✗";

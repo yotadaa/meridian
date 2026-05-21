@@ -10,6 +10,7 @@ const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 const CACHE_PATH = path.join(__dirname, "hivemind-cache.json");
 const PACKAGE_JSON_PATH = path.join(__dirname, "package.json");
 const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_HIVEMIND_API_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
 
 let _heartbeatTimer = null;
 
@@ -59,7 +60,10 @@ function readCache() {
   return readJson(CACHE_PATH, {
     sharedLessons: [],
     presets: [],
+    terminalFeed: [],
+    overview: null,
     pulledAt: null,
+    publicPulledAt: null,
   });
 }
 
@@ -75,6 +79,14 @@ function getApiKey() {
   return sanitizeText(config.hiveMind?.apiKey || "", 300) || "";
 }
 
+function isDefaultHiveMindApiKey(key = getApiKey()) {
+  return !key || key === DEFAULT_HIVEMIND_API_KEY;
+}
+
+export function hasPrivateHiveMindCredentials() {
+  return !!(getBaseUrl() && getApiKey() && !isDefaultHiveMindApiKey());
+}
+
 function getPullMode() {
   const mode = sanitizeText(config.hiveMind?.pullMode || "auto", 20) || "auto";
   return mode === "manual" ? "manual" : "auto";
@@ -85,7 +97,11 @@ export function getHiveMindPullMode() {
 }
 
 export function isHiveMindEnabled() {
-  return !!(getBaseUrl() && getApiKey());
+  return !!getBaseUrl();
+}
+
+export function isHiveMindPrivateEnabled() {
+  return hasPrivateHiveMindCredentials();
 }
 
 export function ensureAgentId() {
@@ -118,7 +134,7 @@ function buildUrl(pathname, query = {}) {
 }
 
 async function requestJson(pathname, { method = "GET", body = null, query = {} } = {}) {
-  if (!isHiveMindEnabled()) return null;
+  if (!hasPrivateHiveMindCredentials()) return null;
   const response = await fetch(buildUrl(pathname, query), {
     method,
     headers: {
@@ -131,6 +147,19 @@ async function requestJson(pathname, { method = "GET", body = null, query = {} }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     throw new Error(payload?.error || `HiveMind ${response.status}`);
+  }
+  return payload;
+}
+
+async function requestPublicJson(pathname, { query = {} } = {}) {
+  if (!getBaseUrl()) return null;
+  const response = await fetch(buildUrl(pathname, query), {
+    method: "GET",
+    headers: { accept: "application/json" },
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(payload?.error || `HiveMind public ${response.status}`);
   }
   return payload;
 }
@@ -150,6 +179,20 @@ function normalizeSharedLesson(lesson) {
   };
 }
 
+function normalizePublicSummaryLesson(lesson) {
+  const normalized = normalizeSharedLesson({
+    ...lesson,
+    sourceType: lesson?.sourceType || "public_summary",
+    outcome: lesson?.consensus || lesson?.outcome || "shared",
+  });
+  if (!normalized) return null;
+  return {
+    ...normalized,
+    consensus: sanitizeText(lesson?.consensus || "", 24) || null,
+    sourceType: "public_summary",
+  };
+}
+
 export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 6 } = {}) {
   const role = String(agentType || "GENERAL").toUpperCase();
   const shared = (readCache().sharedLessons || [])
@@ -166,7 +209,7 @@ export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 
 }
 
 export async function registerHiveMindAgent({ reason = "heartbeat" } = {}) {
-  if (!isHiveMindEnabled()) return null;
+  if (!hasPrivateHiveMindCredentials()) return null;
   try {
     return await requestJson("/api/hivemind/agents/register", {
       method: "POST",
@@ -188,8 +231,34 @@ export async function registerHiveMindAgent({ reason = "heartbeat" } = {}) {
   }
 }
 
+export async function pullPublicHiveMindSummary(limit = 12) {
+  if (!getBaseUrl()) return null;
+  try {
+    const payload = await requestPublicJson("/api/hivemind/summary/public");
+    const graphLessons = Array.isArray(payload?.graph?.lessons) ? payload.graph.lessons : [];
+    const sharedLessons = graphLessons
+      .map(normalizePublicSummaryLesson)
+      .filter(Boolean)
+      .sort((left, right) => (Number(right.score) || 0) - (Number(left.score) || 0))
+      .slice(0, limit);
+
+    const cache = readCache();
+    cache.sharedLessons = sharedLessons;
+    cache.terminalFeed = Array.isArray(payload?.terminalFeed) ? payload.terminalFeed.slice(0, 50) : [];
+    cache.overview = payload?.overview || null;
+    cache.publicPulledAt = new Date().toISOString();
+    cache.pulledAt = cache.publicPulledAt;
+    cache.source = "public_summary";
+    writeCache(cache);
+    return sharedLessons;
+  } catch (error) {
+    log("hivemind_warn", `Public summary pull failed: ${error.message}`);
+    return null;
+  }
+}
+
 export async function pullHiveMindLessons(limit = 12) {
-  if (!isHiveMindEnabled()) return null;
+  if (!hasPrivateHiveMindCredentials()) return pullPublicHiveMindSummary(limit);
   try {
     const payload = await requestJson("/api/hivemind/lessons/pull", {
       query: { agentId: getAgentId(), limit },
@@ -203,12 +272,12 @@ export async function pullHiveMindLessons(limit = 12) {
     return cache.sharedLessons;
   } catch (error) {
     log("hivemind_warn", `Lesson pull failed: ${error.message}`);
-    return null;
+    return pullPublicHiveMindSummary(limit);
   }
 }
 
 export async function pullHiveMindPresets() {
-  if (!isHiveMindEnabled()) return null;
+  if (!hasPrivateHiveMindCredentials()) return null;
   try {
     const payload = await requestJson("/api/hivemind/presets/pull", {
       query: { agentId: getAgentId() },
@@ -227,20 +296,24 @@ export async function pullHiveMindPresets() {
 export async function bootstrapHiveMind() {
   if (!isHiveMindEnabled()) return null;
   ensureAgentId();
-  const tasks = [registerHiveMindAgent({ reason: "startup" })];
+  const tasks = [];
+  if (hasPrivateHiveMindCredentials()) tasks.push(registerHiveMindAgent({ reason: "startup" }));
   if (getPullMode() === "auto") {
-    tasks.push(pullHiveMindLessons(), pullHiveMindPresets());
+    tasks.push(pullHiveMindLessons());
+    if (hasPrivateHiveMindCredentials()) tasks.push(pullHiveMindPresets());
   }
   await Promise.allSettled(tasks);
-  return { enabled: true, agentId: getAgentId(), pullMode: getPullMode() };
+  return { enabled: true, private: hasPrivateHiveMindCredentials(), agentId: getAgentId(), pullMode: getPullMode() };
 }
 
 export function startHiveMindBackgroundSync() {
   if (!isHiveMindEnabled() || _heartbeatTimer) return null;
   _heartbeatTimer = setInterval(() => {
-    const tasks = [registerHiveMindAgent({ reason: "heartbeat" })];
+    const tasks = [];
+    if (hasPrivateHiveMindCredentials()) tasks.push(registerHiveMindAgent({ reason: "heartbeat" }));
     if (getPullMode() === "auto") {
-      tasks.push(pullHiveMindLessons(), pullHiveMindPresets());
+      tasks.push(pullHiveMindLessons());
+      if (hasPrivateHiveMindCredentials()) tasks.push(pullHiveMindPresets());
     }
     Promise.allSettled(tasks).catch(() => null);
   }, HEARTBEAT_INTERVAL_MS);
@@ -290,7 +363,7 @@ function inferLessonSourceType(lesson) {
 }
 
 export async function pushHiveLesson(lesson) {
-  if (!isHiveMindEnabled()) return null;
+  if (!hasPrivateHiveMindCredentials()) return null;
   const body = buildLessonEvent(lesson);
   if (!body) return null;
   try {
@@ -315,7 +388,7 @@ function shouldCountInAdjustedWinRate(closeReason) {
 }
 
 export async function pushHivePerformanceEvent(perf) {
-  if (!isHiveMindEnabled()) return null;
+  if (!hasPrivateHiveMindCredentials()) return null;
   try {
     return await requestJson("/api/hivemind/performance/push", {
       method: "POST",

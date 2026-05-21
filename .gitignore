@@ -26,12 +26,18 @@ paper-trading.json
 logs/
 previews/
 
+# Local WhatsApp/browser sessions (contains auth/session data)
+.wwebjs_auth/
+.wwebjs_cache/
+
 # OS
 .DS_Store
 
 # Dev context
 context.md
 CONTEXT.md
+.opencode-context.md
+.opencode-jce/
 dev-blocklist.json
 docs/
 

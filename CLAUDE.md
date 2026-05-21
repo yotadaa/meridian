@@ -75,6 +75,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minHolders | screening | 500 |
 | minMcap / maxMcap | screening | 150k / 10M |
 | minBinStep / maxBinStep | screening | 80 / 125 |
+| maxVolatility | screening | null |
 | timeframe | screening | "5m" |
 | category | screening | "trending" |
 | minTokenFeesSol | screening | 30 |
@@ -88,6 +89,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
+| downsideOutOfRangeBinsToClose | management | 8 |
+| downsideOutOfRangeWaitMinutes | management | 10 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
@@ -115,7 +118,7 @@ Before `deploy_position` executes:
 - No duplicate pool allowed (same pool_address)
 - No duplicate base token allowed (same base_mint in another pool)
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
-- SOL balance must cover `amount_y + gasReserve`
+- Effective SOL balance (live wallet or dry-run paper wallet) must cover `max(minSolToOpen, amount_y + gasReserve)`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
 
 ---
@@ -192,9 +195,9 @@ const actualBaseFee = baseFactor > 0
 
 `lessons.js` records closed position performance and auto-derives lessons. Key points:
 - `getLessonsForPrompt({ agentType })` — injects relevant lessons into system prompt
-- `evolveThresholds()` — adjusts screening thresholds based on winners vs losers
+- `evolveThresholds()` — adjusts `minFeeActiveTvlRatio`, `minOrganic`, and optional `maxVolatility` based on winners vs losers
 - Performance recorded via `recordPerformance()` called from executor.js after `close_position`
-- **Known issue**: `evolveThresholds()` references `maxVolatility` and `minFeeTvlRatio` but config.js uses `minFeeActiveTvlRatio` and has no `maxVolatility` key — the evolution of these keys is a no-op
+- `maxVolatility: null` means no hard volatility ceiling until learning/data sets one.
 
 ---
 
@@ -224,5 +227,4 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ## Known Issues / Tech Debt
 
-- `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.

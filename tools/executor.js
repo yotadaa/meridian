@@ -10,6 +10,7 @@ import {
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
+import { getPaperBalance } from "./paper.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
@@ -42,11 +43,67 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifySwap } from "../communication.js";
 
 function numberOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function clampNumber(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function binsForDownsidePct(binStep, downsidePct) {
+  const step = Number(binStep) / 10_000;
+  if (!Number.isFinite(step) || step <= 0) return null;
+  const safeDownside = clampNumber(Number(downsidePct), 0.01, 0.95);
+  return Math.ceil(Math.log(1 / (1 - safeDownside)) / Math.log(1 + step));
+}
+
+function normalizedBinsBelow({ binsBelow, binStep, volatility }) {
+  const lo = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+  const hi = Math.max(lo, Number(config.strategy.maxBinsBelow ?? config.strategy.defaultBinsBelow ?? lo));
+  const fallback = clampNumber(Number(config.strategy.defaultBinsBelow ?? hi), lo, hi);
+  const parsedVolatility = Number(volatility);
+  const requested = Number(binsBelow);
+
+  if (!Number.isFinite(parsedVolatility) || parsedVolatility <= 0) {
+    return Number.isFinite(requested) ? clampNumber(Math.round(requested), lo, hi) : fallback;
+  }
+
+  const volNorm = clampNumber(parsedVolatility / 5, 0, 1);
+  const targetDownsidePct = 0.25 + volNorm * 0.30;
+  const byBinStep = binsForDownsidePct(binStep, targetDownsidePct);
+  if (byBinStep != null) return clampNumber(byBinStep, lo, hi);
+
+  return clampNumber(Math.round(lo + volNorm * (hi - lo)), lo, hi);
+}
+
+async function getEffectiveSolBalance() {
+  if (process.env.DRY_RUN === "true") {
+    const paperSol = getPaperBalance();
+    return Number.isFinite(Number(paperSol)) ? Number(paperSol) : 0;
+  }
+
+  const balance = await getWalletBalances();
+  return Number(balance?.sol ?? 0);
+}
+
+async function validateCapitalForDeploy(amountY) {
+  const balanceSol = await getEffectiveSolBalance();
+  const gasReserve = Number(config.management.gasReserve ?? 0);
+  const minSolToOpen = Number(config.management.minSolToOpen ?? 0);
+  const minRequired = Math.max(minSolToOpen, Number(amountY) + gasReserve);
+
+  if (!Number.isFinite(balanceSol) || balanceSol < minRequired) {
+    return {
+      pass: false,
+      reason: `Insufficient SOL: have ${Number.isFinite(balanceSol) ? balanceSol : "unknown"} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve; minSolToOpen ${minSolToOpen}).`,
+    };
+  }
+
+  return { pass: true, balanceSol, minRequired };
 }
 
 function getVolatilityTimeframe(sourceTimeframe) {
@@ -350,6 +407,7 @@ const toolMap = {
       maxMcap: ["screening", "maxMcap"],
       minBinStep: ["screening", "minBinStep"],
       maxBinStep: ["screening", "maxBinStep"],
+      maxVolatility: ["screening", "maxVolatility"],
       timeframe: ["screening", "timeframe"],
       category: ["screening", "category"],
       minTokenFeesSol: ["screening", "minTokenFeesSol"],
@@ -371,6 +429,8 @@ const toolMap = {
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+      downsideOutOfRangeBinsToClose: ["management", "downsideOutOfRangeBinsToClose"],
+      downsideOutOfRangeWaitMinutes: ["management", "downsideOutOfRangeWaitMinutes"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],
       repeatDeployCooldownEnabled: ["management", "repeatDeployCooldownEnabled"],
@@ -560,6 +620,37 @@ const PROTECTED_TOOLS = new Set([
   "self_update",
 ]);
 
+let _protectedToolQueue = Promise.resolve();
+
+async function withProtectedToolLock(fn) {
+  const previous = _protectedToolQueue;
+  let release;
+  _protectedToolQueue = new Promise((resolve) => { release = resolve; });
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+async function findLiveOwnedPosition(positionAddress) {
+  const normalized = String(positionAddress || "").trim();
+  if (!normalized) {
+    return { pass: false, reason: "position_address is required." };
+  }
+
+  const positions = await getMyPositions({ force: true, silent: true });
+  const match = positions?.positions?.find((p) => p.position === normalized);
+  if (!match) {
+    return {
+      pass: false,
+      reason: `Position ${normalized} is not an open position owned by this wallet. Refusing transaction.`,
+    };
+  }
+  return { pass: true, position: match, positions };
+}
+
 /**
  * Execute a tool call with safety checks and logging.
  */
@@ -568,6 +659,15 @@ export async function executeTool(name, args) {
 
   // Strip model artifacts like "<|channel|>commentary" appended to tool names
   name = name.replace(/<.*$/, "").trim();
+
+  if (PROTECTED_TOOLS.has(name)) {
+    return withProtectedToolLock(() => executeToolUnlocked(name, args, startTime));
+  }
+
+  return executeToolUnlocked(name, args, startTime);
+}
+
+async function executeToolUnlocked(name, args, startTime) {
 
   // ─── Validate tool exists ─────────────────
   const fn = toolMap[name];
@@ -703,10 +803,7 @@ async function runSafetyChecks(name, args) {
       if (!hasMeaningfulPctRange && (!Number.isFinite(Number(args.bins_below)) || Number(args.bins_below) < minBinsBelow)) {
         args.bins_below = fallbackBinsBelow;
       }
-      const requestedBinsBelow = Number(args.bins_below);
-      const requestedBinsAbove = Number(args.bins_above ?? 0);
       const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
-      const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
       const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
       if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
         return {
@@ -714,27 +811,38 @@ async function runSafetyChecks(name, args) {
           reason: `volatility ${args.volatility} is invalid. Refusing deploy because the volatility feed is unusable.`,
         };
       }
+      if (isSingleSidedSol && !hasMeaningfulPctRange) {
+        args.bins_below = normalizedBinsBelow({
+          binsBelow: args.bins_below,
+          binStep: args.bin_step,
+          volatility: args.volatility,
+        });
+        args.bins_above = 0;
+      }
+      const normalizedRequestedBinsBelow = Number(args.bins_below);
+      const normalizedRequestedBinsAbove = Number(args.bins_above ?? 0);
+      const normalizedRequestedTotalBins = normalizedRequestedBinsBelow + normalizedRequestedBinsAbove;
       if (
         !hasMeaningfulPctRange &&
         (
-          !Number.isFinite(requestedBinsBelow) ||
-          !Number.isFinite(requestedBinsAbove) ||
-          !Number.isInteger(requestedBinsBelow) ||
-          !Number.isInteger(requestedBinsAbove) ||
-          requestedBinsBelow < 0 ||
-          requestedBinsAbove < 0 ||
-          requestedTotalBins < minBinsBelow
+          !Number.isFinite(normalizedRequestedBinsBelow) ||
+          !Number.isFinite(normalizedRequestedBinsAbove) ||
+          !Number.isInteger(normalizedRequestedBinsBelow) ||
+          !Number.isInteger(normalizedRequestedBinsAbove) ||
+          normalizedRequestedBinsBelow < 0 ||
+          normalizedRequestedBinsAbove < 0 ||
+          normalizedRequestedTotalBins < minBinsBelow
         )
       ) {
         return {
           pass: false,
-          reason: `deploy range ${requestedTotalBins} total bins is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+          reason: `deploy range ${normalizedRequestedTotalBins} total bins is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
         };
       }
       if (
         isSingleSidedSol &&
         !hasMeaningfulPctRange &&
-        (!Number.isFinite(requestedBinsBelow) || !Number.isInteger(requestedBinsBelow) || requestedBinsBelow < minBinsBelow)
+        (!Number.isFinite(normalizedRequestedBinsBelow) || !Number.isInteger(normalizedRequestedBinsBelow) || normalizedRequestedBinsBelow < minBinsBelow)
       ) {
         return {
           pass: false,
@@ -744,7 +852,7 @@ async function runSafetyChecks(name, args) {
       if (
         isSingleSidedSol &&
         args.upside_pct == null &&
-        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove !== 0)
+        (!Number.isFinite(normalizedRequestedBinsAbove) || !Number.isInteger(normalizedRequestedBinsAbove) || normalizedRequestedBinsAbove !== 0)
       ) {
         return {
           pass: false,
@@ -806,25 +914,64 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check SOL balance
-      if (process.env.DRY_RUN !== "true") {
-        const balance = await getWalletBalances();
-        const gasReserve = config.management.gasReserve;
-        const minRequired = amountY + gasReserve;
-        if (balance.sol < minRequired) {
-          return {
-            pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
-          };
-        }
+      // Check effective SOL balance (live wallet or dry-run paper wallet) with the same reserve/min-open rule.
+      const capitalCheck = await validateCapitalForDeploy(amountY);
+      if (!capitalCheck.pass) {
+        return capitalCheck;
       }
 
       return { pass: true };
     }
 
     case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
+      const inputMint = String(args?.input_mint || "").trim();
+      const outputMint = String(args?.output_mint || "").trim();
+      const amount = Number(args?.amount);
+      if (!inputMint || !outputMint) {
+        return { pass: false, reason: "swap_token requires input_mint and output_mint." };
+      }
+      if (inputMint === outputMint) {
+        return { pass: false, reason: "swap_token input_mint and output_mint are the same." };
+      }
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return { pass: false, reason: "swap_token amount must be a positive finite number." };
+      }
+      if (process.env.DRY_RUN !== "true") {
+        const balances = await getWalletBalances({});
+        const normalizedInput = inputMint === "SOL" || inputMint === config.tokens.SOL ? config.tokens.SOL : inputMint;
+        const available = normalizedInput === config.tokens.SOL
+          ? Number(balances.sol || 0)
+          : Number(balances.tokens?.find((t) => t.mint === normalizedInput)?.balance || 0);
+        if (!Number.isFinite(available) || available <= 0) {
+          return { pass: false, reason: `No available balance for input mint ${inputMint}.` };
+        }
+        if (amount > available) {
+          return { pass: false, reason: `Swap amount ${amount} exceeds available balance ${available} for ${inputMint}.` };
+        }
+        if (normalizedInput === config.tokens.SOL) {
+          const gasReserve = Number(config.management.gasReserve ?? 0);
+          if (available - amount < gasReserve) {
+            return { pass: false, reason: `Swap would leave ${available - amount} SOL, below gas reserve ${gasReserve}.` };
+          }
+        }
+      }
+      return { pass: true };
+    }
+
+    case "claim_fees": {
+      const live = await findLiveOwnedPosition(args?.position_address);
+      if (!live.pass) return live;
+      const feesUsd = Number(live.position.unclaimed_fees_usd ?? live.position.unclaimed_fees_true_usd ?? 0);
+      const minClaim = Number(config.management.minClaimAmount ?? 0);
+      if (Number.isFinite(minClaim) && minClaim > 0 && Number.isFinite(feesUsd) && feesUsd < minClaim) {
+        return { pass: false, reason: `Unclaimed fees $${feesUsd.toFixed(2)} are below minClaimAmount $${minClaim}.` };
+      }
+      return { pass: true };
+    }
+
+    case "close_position": {
+      const live = await findLiveOwnedPosition(args?.position_address);
+      if (!live.pass) return live;
       return { pass: true };
     }
 
