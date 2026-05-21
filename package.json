@@ -10,6 +10,7 @@
   "scripts": {
     "setup": "node setup.js",
     "setup:communication": "node scripts/setup-communication.js",
+    "dashboard": "node scripts/dashboard-server.js",
     "env:encrypt": "node scripts/envrypt.js encrypt",
     "preview": "node scripts/generate-preview.js",
     "start": "node index.js",
