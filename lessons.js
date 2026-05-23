@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +32,36 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "volatility",
 ];
 const MAX_MANUAL_LESSON_LENGTH = 400;
+
+function finiteNumber(value, fallback = null) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+export function getLearningThresholds() {
+  const learning = config.learning || {};
+  return {
+    goodPnlPctThreshold: finiteNumber(learning.goodPnlPctThreshold, 1.25),
+    goodProfitSolThreshold: finiteNumber(learning.goodProfitSolThreshold, 0.01),
+    goodFeeYieldPctThreshold: finiteNumber(learning.goodFeeYieldPctThreshold, 1),
+    badPnlPctThreshold: finiteNumber(learning.badPnlPctThreshold, -3),
+  };
+}
+
+export function classifyPerformanceOutcome(perf) {
+  const thresholds = getLearningThresholds();
+  const feeYieldPct = perf.initial_value_usd > 0
+    ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100
+    : 0;
+  const pnlSol = Number.isFinite(perf.pnl_sol) ? perf.pnl_sol : null;
+
+  if (perf.pnl_pct >= thresholds.goodPnlPctThreshold) return "good";
+  if (pnlSol != null && pnlSol >= thresholds.goodProfitSolThreshold) return "good";
+  if (perf.pnl_pct >= 0 && feeYieldPct >= thresholds.goodFeeYieldPctThreshold) return "good";
+  if (perf.pnl_pct >= 0) return "neutral";
+  if (perf.pnl_pct >= thresholds.badPnlPctThreshold) return "poor";
+  return "bad";
+}
 
 function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
   if (text == null) return null;
@@ -95,6 +126,8 @@ function buildSignalSnapshot(perf) {
  */
 export async function recordPerformance(perf) {
   const data = load();
+  const sourceType = perf.sourceType || "performance";
+  const sourceConfidence = perf.confidence ?? (sourceType === "paper" ? "low" : undefined);
 
   // Guard against unit-mixed records where a SOL-sized final value is
   // accidentally written into a USD field (e.g. final_value_usd = 2 for a 2 SOL close).
@@ -116,6 +149,11 @@ export async function recordPerformance(perf) {
   const pnl_pct = perf.initial_value_usd > 0
     ? (pnl_usd / perf.initial_value_usd) * 100
     : 0;
+  const pnl_sol = Number.isFinite(perf.pnl_sol)
+    ? perf.pnl_sol
+    : (Number.isFinite(perf.amount_sol) && perf.initial_value_usd > 0
+      ? (pnl_usd / perf.initial_value_usd) * perf.amount_sol
+      : null);
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
@@ -135,8 +173,11 @@ export async function recordPerformance(perf) {
   const signalSnapshot = buildSignalSnapshot(perf);
   const entry = {
     ...perf,
+    sourceType,
+    confidence: sourceConfidence,
     signal_snapshot: signalSnapshot,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
+    pnl_sol: pnl_sol == null ? null : Math.round(pnl_sol * 1e9) / 1e9,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
     recorded_at: new Date().toISOString(),
@@ -152,12 +193,12 @@ export async function recordPerformance(perf) {
   }
 
   save(data);
-  if (lesson) {
+  if (lesson && sourceType !== "paper") {
     void pushHiveLesson(lesson);
   }
 
   // Update pool-level memory
-  if (perf.pool) {
+  if (perf.pool && sourceType !== "paper") {
     const { recordPoolDeploy } = await import("./pool-memory.js");
     recordPoolDeploy(perf.pool, {
       pool_name: perf.pool_name,
@@ -175,12 +216,24 @@ export async function recordPerformance(perf) {
       strategy: perf.strategy,
       volatility: perf.volatility,
     });
+  } else if (perf.pool && sourceType === "paper") {
+    // Paper closes should block immediate churn/redeploy of the same bad pool,
+    // but must not count as live deploy history, threshold evolution, or HiveMind evidence.
+    const { recordPoolCloseSignal } = await import("./pool-memory.js");
+    recordPoolCloseSignal(perf.pool, {
+      pool_name: perf.pool_name,
+      base_mint: perf.base_mint,
+      close_reason: perf.close_reason,
+      sourceType: "paper",
+    });
   }
 
-  // Evolve thresholds every 5 closed positions
-  if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
+  // Evolve live thresholds only from real closed positions. Paper closes can
+  // create low-confidence prompt lessons, but must not rewrite live filters.
+  const livePerformance = data.performance.filter((p) => p.sourceType !== "paper");
+  if (sourceType !== "paper" && livePerformance.length > 0 && livePerformance.length % MIN_EVOLVE_POSITIONS === 0) {
     const { config, reloadScreeningThresholds } = await import("./config.js");
-    const result = evolveThresholds(data.performance, config);
+    const result = evolveThresholds(livePerformance, config);
     if (result?.changes && Object.keys(result.changes).length > 0) {
       reloadScreeningThresholds();
       log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
@@ -189,20 +242,30 @@ export async function recordPerformance(perf) {
     // Darwinian signal weight recalculation
     if (config.darwin?.enabled) {
       const { recalculateWeights } = await import("./signal-weights.js");
-      const wResult = recalculateWeights(data.performance, config);
+      const wResult = recalculateWeights(livePerformance, config);
       if (wResult.changes.length > 0) {
         log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
       }
     }
   }
 
-  void pushHivePerformanceEvent({
-    ...entry,
-    base_mint: perf.base_mint || null,
-    fees_earned_sol: perf.fees_earned_sol || 0,
-    eventId: `close:${perf.position}:${entry.recorded_at}`,
-  });
+  if (sourceType !== "paper") {
+    void pushHivePerformanceEvent({
+      ...entry,
+      base_mint: perf.base_mint || null,
+      fees_earned_sol: perf.fees_earned_sol || 0,
+      eventId: `close:${perf.position}:${entry.recorded_at}`,
+    });
+  }
 
+}
+
+export async function recordPaperPerformance(perf) {
+  return recordPerformance({
+    ...perf,
+    sourceType: "paper",
+    confidence: "low",
+  });
 }
 
 /**
@@ -216,11 +279,7 @@ function derivLesson(perf) {
     : 0;
 
   // Categorize outcome
-  const outcome = perf.pnl_pct >= 5 ? "good"
-    : (perf.pnl_pct >= 0 && feeYieldPct >= 2) ? "good"
-    : perf.pnl_pct >= 0 ? "neutral"
-    : perf.pnl_pct >= -5 ? "poor"
-    : "bad";
+  const outcome = classifyPerformanceOutcome(perf);
 
   if (outcome === "neutral") return null; // nothing interesting to learn
 
@@ -236,22 +295,23 @@ function derivLesson(perf) {
   ].join(", ");
 
   let rule = "";
+  const isPaper = perf.sourceType === "paper";
 
   if (outcome === "good" || outcome === "bad") {
     if (perf.range_efficiency < 30 && outcome === "bad") {
-      rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
+      rule = `${isPaper ? "PAPER WARNING" : "AVOID"}: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
-      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
+      rule = `${isPaper ? "PAPER SIGNAL" : "PREFER"}: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
       tags.push("efficient", perf.strategy);
     } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
-      rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
+      rule = `${isPaper ? "PAPER WARNING" : "AVOID"}: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
       tags.push("volume_collapse");
     } else if (outcome === "good") {
-      rule = `WORKED: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
+      rule = `${isPaper ? "PAPER SIGNAL" : "WORKED"}: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
       tags.push("worked");
     } else {
-      rule = `FAILED: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
+      rule = `${isPaper ? "PAPER WARNING" : "FAILED"}: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
       tags.push("failed");
     }
   }
@@ -285,8 +345,8 @@ function derivLesson(perf) {
     rule,
     tags,
     outcome,
-    sourceType: "performance",
-    confidence: Math.round(confidence * 100) / 100,
+    sourceType: perf.sourceType || "performance",
+    confidence: perf.sourceType === "paper" ? Math.min(0.45, Math.round(confidence * 100) / 100) : Math.round(confidence * 100) / 100,
     context,
     pnl_pct: perf.pnl_pct,
     fees_earned_usd: perf.fees_earned_usd,

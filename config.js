@@ -13,6 +13,7 @@ const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
 export const MIN_SAFE_BINS_BELOW = 35;
+export const DRY_RUN_DEGEN_MIN_SAFE_BINS_BELOW = 14;
 
 function numericConfig(value) {
   const n = Number(value);
@@ -20,11 +21,13 @@ function numericConfig(value) {
 }
 
 const legacyBinsBelow = numericConfig(u.binsBelow);
+const dryRunDegenPreset = (u.dryRun === true || String(u.dryRun).toLowerCase() === "true") && String(u.preset || "").toLowerCase() === "degen";
+const minSafeBinsBelow = dryRunDegenPreset ? DRY_RUN_DEGEN_MIN_SAFE_BINS_BELOW : MIN_SAFE_BINS_BELOW;
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
   ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 69);
 const configuredDefaultBinsBelow = numericConfig(u.defaultBinsBelow) ?? legacyBinsBelow ?? configuredMaxBinsBelow;
-const strategyMinBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(configuredMinBinsBelow));
+const strategyMinBinsBelow = Math.max(minSafeBinsBelow, Math.round(configuredMinBinsBelow));
 const strategyMaxBinsBelow = Math.max(strategyMinBinsBelow, Math.round(configuredMaxBinsBelow));
 const strategyDefaultBinsBelow = Math.max(
   strategyMinBinsBelow,
@@ -41,7 +44,7 @@ if (u.llmProvider) process.env.LLM_PROVIDER    ||= u.llmProvider;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
-if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
+if (u.dryRun !== undefined) process.env.DRY_RUN = String(u.dryRun);
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
 
@@ -57,6 +60,9 @@ function nonEmptyString(...values) {
 }
 
 export const config = {
+  preset: u.preset ?? null,
+  dryRun: String(process.env.DRY_RUN || "").toLowerCase() === "true",
+
   // ─── Risk Limits ─────────────────────────
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
@@ -103,6 +109,9 @@ export const config = {
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     downsideOutOfRangeBinsToClose: u.downsideOutOfRangeBinsToClose ?? 8,
     downsideOutOfRangeWaitMinutes: u.downsideOutOfRangeWaitMinutes ?? 10,
+    profitableUpsideOorGraceMinutes: u.profitableUpsideOorGraceMinutes ?? 25,
+    profitableUpsideOorMinPnlPct: u.profitableUpsideOorMinPnlPct ?? 0,
+    profitableUpsideOorFeeStallMinutes: u.profitableUpsideOorFeeStallMinutes ?? 10,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -167,6 +176,16 @@ export const config = {
     weightFloor:    u.darwinFloor       ?? 0.3,
     weightCeiling:  u.darwinCeiling     ?? 2.5,
     minSamples:     u.darwinMinSamples  ?? 10,
+  },
+
+  // ─── Learning / Lesson Thresholds ───────
+  learning: {
+    // Generate a positive lesson when either percentage PnL or estimated SOL
+    // profit clears these thresholds. 0.01 SOL on a 0.7 SOL position is ~1.43%.
+    goodPnlPctThreshold: u.goodPnlPctThreshold ?? 1.25,
+    goodProfitSolThreshold: u.goodProfitSolThreshold ?? 0.01,
+    goodFeeYieldPctThreshold: u.goodFeeYieldPctThreshold ?? 1,
+    badPnlPctThreshold: u.badPnlPctThreshold ?? -3,
   },
 
   // ─── Common Token Mints ────────────────
@@ -280,7 +299,9 @@ export function reloadScreeningThresholds() {
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;
-    config.strategy.minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(minBinsBelow));
+    const freshDryRunDegenPreset = (fresh.dryRun === true || String(fresh.dryRun).toLowerCase() === "true") && String(fresh.preset || "").toLowerCase() === "degen";
+    const freshMinSafeBinsBelow = freshDryRunDegenPreset ? DRY_RUN_DEGEN_MIN_SAFE_BINS_BELOW : MIN_SAFE_BINS_BELOW;
+    config.strategy.minBinsBelow = Math.max(freshMinSafeBinsBelow, Math.round(minBinsBelow));
     config.strategy.maxBinsBelow = Math.max(config.strategy.minBinsBelow, Math.round(maxBinsBelow));
     config.strategy.defaultBinsBelow = Math.max(
       config.strategy.minBinsBelow,

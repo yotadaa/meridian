@@ -41,6 +41,10 @@ function isOorCloseReason(reason) {
   return text === "oor" || text.includes("out of range") || text.includes("oor");
 }
 
+export function isLowYieldCloseReason(reason) {
+  return String(reason || "").trim().toLowerCase().includes("low yield");
+}
+
 function isAdjustedWinRateExcludedReason(reason) {
   const text = String(reason || "").trim().toLowerCase();
   return text.includes("out of range") ||
@@ -162,7 +166,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
   }
 
   // Set cooldown for low yield closes — pool wasn't profitable enough, don't redeploy soon
-  if (deploy.close_reason === "low yield") {
+  if (isLowYieldCloseReason(deploy.close_reason)) {
     const cooldownHours = 4;
     const cooldownUntil = setPoolCooldown(entry, cooldownHours, "low yield");
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
@@ -213,6 +217,41 @@ export function recordPoolDeploy(poolAddress, deployData) {
 
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
+}
+
+export function recordPoolCloseSignal(poolAddress, signal = {}) {
+  if (!poolAddress) return null;
+  if (!isLowYieldCloseReason(signal.close_reason)) return null;
+
+  const db = load();
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: signal.pool_name || poolAddress.slice(0, 8),
+      base_mint: signal.base_mint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+
+  const entry = db[poolAddress];
+  if (signal.pool_name) entry.name = signal.pool_name;
+  if (signal.base_mint && !entry.base_mint) entry.base_mint = signal.base_mint;
+
+  const cooldownHours = Math.max(0, Number(signal.cooldownHours ?? 4));
+  const cooldownUntil = setPoolCooldown(entry, cooldownHours, "low yield");
+  const note = sanitizeStoredNote(`${signal.sourceType || "close"}: low yield cooldown set at ${new Date().toISOString()}`);
+  if (note) entry.notes = [...(entry.notes || []), note].slice(-20);
+
+  save(db);
+  log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield ${signal.sourceType || "close"})`);
+  return { pool_address: poolAddress, cooldown_until: cooldownUntil, reason: "low yield" };
 }
 
 export function isPoolOnCooldown(poolAddress) {
@@ -320,6 +359,18 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
   }
 
   save(db);
+}
+
+export function getRecentPositionSnapshots(poolAddress, positionAddress, minutesBack = 30) {
+  if (!poolAddress) return [];
+  const db = load();
+  const snapshots = db[poolAddress]?.snapshots || [];
+  const cutoff = Date.now() - Math.max(0, Number(minutesBack || 0)) * 60_000;
+  return snapshots.filter((snapshot) => {
+    if (positionAddress && snapshot.position !== positionAddress) return false;
+    const ts = snapshot.ts ? new Date(snapshot.ts).getTime() : 0;
+    return Number.isFinite(ts) && ts >= cutoff;
+  });
 }
 
 /**

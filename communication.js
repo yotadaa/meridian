@@ -1,12 +1,31 @@
 import * as telegram from "./telegram.js";
 import * as whatsapp from "./whatsapp.js";
+import fs from "fs";
+
+const USER_CONFIG_PATH = "./user-config.json";
+
+function loadCommsConfig() {
+  try {
+    if (fs.existsSync(USER_CONFIG_PATH)) return JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+  } catch { /* ignore */ }
+  return {};
+}
+
+function preferredChannelName() {
+  return String(loadCommsConfig().preferredChannel || process.env.PREFERRED_CHANNEL || "telegram").toLowerCase();
+}
+
+function telegramFallbackEnabled() {
+  const cfg = loadCommsConfig();
+  return cfg.telegramFallbackEnabled === true || process.env.TELEGRAM_FALLBACK_ENABLED === "true";
+}
 
 function preferred() {
-  return whatsapp.isEnabled() ? whatsapp : telegram;
+  return preferredChannelName() === "whatsapp" ? whatsapp : telegram;
 }
 
 function fallback(channel) {
-  return channel === whatsapp ? telegram : null;
+  return channel === whatsapp && telegramFallbackEnabled() ? telegram : null;
 }
 
 async function callWithFallback(method, args) {

@@ -27,7 +27,7 @@ import {
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { recordPositionSnapshot, recallForPool, addPoolNote, getRecentPositionSnapshots } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -731,7 +731,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL | Max per position: ${config.risk.maxDeployAmount} SOL
+
+${String(config.preset || "").toLowerCase() === "degen" ? `DEGEN MODE:
+- If at least one candidate passes hard filters and has no direct rug/wash/scam block, prefer deploying the best candidate instead of waiting for perfection.
+- Do not require smart-wallet confirmation when fee flow, volume, bin_step, and narrative are acceptable.
+- Use faster high-turn ranges: bins_below must stay within [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].` : ""}
+
+DEPLOY AMOUNT RULE:
+- Call deploy_position with amount_y exactly ${deployAmount} SOL.
+- Never use the full wallet balance as amount_y.
+- Never exceed maxDeployAmount ${config.risk.maxDeployAmount} SOL.
+- If a deploy is blocked only because amount_y is too high, retry once with amount_y=${Math.min(deployAmount, config.risk.maxDeployAmount)}.
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
@@ -1016,6 +1027,21 @@ function formatCandidates(candidates) {
   ].join("\n");
 }
 
+function totalFeesForPosition(position) {
+  return Number(position.unclaimed_fees_usd ?? 0) + Number(position.collected_fees_usd ?? 0);
+}
+
+function hasFeeGrowthStalled(position, stallMinutes) {
+  const minutes = Number(stallMinutes ?? 0);
+  if (!Number.isFinite(minutes) || minutes <= 0 || !position.pool || !position.position) return false;
+  const snapshots = getRecentPositionSnapshots(position.pool, position.position, minutes);
+  if (snapshots.length < 2) return false;
+  const firstFees = Number(snapshots[0].unclaimed_fees_usd ?? 0);
+  const currentFees = totalFeesForPosition(position);
+  if (!Number.isFinite(firstFees) || !Number.isFinite(currentFees)) return false;
+  return currentFees <= firstFees + 0.000001;
+}
+
 export function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
@@ -1036,13 +1062,6 @@ export function getDeterministicCloseRule(position, managementConfig) {
   }
   if (
     position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
-  ) {
-    return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
-  }
-  if (
-    position.active_bin != null &&
     position.lower_bin != null &&
     managementConfig.downsideOutOfRangeBinsToClose != null &&
     position.active_bin < position.lower_bin - managementConfig.downsideOutOfRangeBinsToClose &&
@@ -1050,10 +1069,39 @@ export function getDeterministicCloseRule(position, managementConfig) {
   ) {
     return { action: "CLOSE", rule: 3.5, reason: "dumped far below range" };
   }
-  if (
+
+  const isUpsideOor =
     position.active_bin != null &&
     position.upper_bin != null &&
-    position.active_bin > position.upper_bin &&
+    position.active_bin > position.upper_bin;
+  const upsideOorMinutes = Number(position.minutes_out_of_range ?? 0);
+  const minProfitableOorPnl = Number(managementConfig.profitableUpsideOorMinPnlPct ?? 0);
+  const profitableUpsideOor =
+    isUpsideOor &&
+    !pnlSuspect &&
+    position.pnl_pct != null &&
+    Number(position.pnl_pct) >= minProfitableOorPnl;
+
+  if (profitableUpsideOor) {
+    const graceMinutes = Number(managementConfig.profitableUpsideOorGraceMinutes ?? managementConfig.outOfRangeWaitMinutes ?? 0);
+    const feeStallMinutes = Number(managementConfig.profitableUpsideOorFeeStallMinutes ?? 0);
+    if (feeStallMinutes > 0 && upsideOorMinutes >= feeStallMinutes && hasFeeGrowthStalled(position, feeStallMinutes)) {
+      return { action: "CLOSE", rule: 3.2, reason: "profitable upside OOR fee stalled" };
+    }
+    if (graceMinutes > 0 && upsideOorMinutes < graceMinutes) {
+      return null;
+    }
+    return { action: "CLOSE", rule: 3.3, reason: "profitable upside OOR grace expired" };
+  }
+
+  if (
+    isUpsideOor &&
+    position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
+  ) {
+    return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
+  }
+  if (
+    isUpsideOor &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
     return { action: "CLOSE", rule: 4, reason: "OOR" };
